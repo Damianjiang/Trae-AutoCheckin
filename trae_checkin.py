@@ -1403,36 +1403,67 @@ def claim_with_retry(acc, cache):
     return False, last[0], last[1], None
 
 
-def credits_summary(acc):
-    """查询当前积分余额：优先用 usage_summary（总额-已用），再按 entitlement
-    包求和兜底。实测该接口把 pack_list 放在根级（逆向资料里是 data 包装），两种都认。
-    查不到返回 None。"""
-    status, text = _post(EP_ENTITLE, ug_headers(acc['accessToken'], acc.get('deviceId')),
-                         '{"require_usage": true}', 15)
-    try:
-        d = json.loads(text)
-    except Exception:
+def parse_credits(payload):
+    """从权益接口返回里算剩余积分：usage_summary 优先，包列表兜底。查不到返回 None。"""
+    root = (payload or {}).get('data') if isinstance(payload, dict) else None
+    root = root or payload or {}
+    if not isinstance(root, dict):
         return None
-    root = d.get('data') or d
-    us = root.get('usage_summary') or {}
+    summary = root.get('usage_summary') or {}
     try:
-        total_amount, consumed = float(us.get('total_amount') or 0), float(us.get('consumed_amount') or 0)
+        total_amount = float(summary.get('total_amount') or 0)
+        consumed = float(summary.get('consumed_amount') or 0)
         if total_amount > 0:
             return total_amount - consumed
     except Exception:
         pass
     try:
         packs = root.get('user_entitlement_pack_list') or []
-        total, found = 0, False
-        for p in packs:
-            limit = ((p.get('entitlement_base_info') or {}).get('quota') or {}).get('credits_limit') or 0
-            used = (p.get('usage') or {}).get('credits_amount') or 0
+        total, found = 0.0, False
+        for item in packs:
+            quota = ((item.get('entitlement_base_info') or {}).get('quota') or {})
+            limit = quota.get('credits_limit') or 0
+            used = (item.get('usage') or {}).get('credits_amount') or 0
             if limit > 0:
                 found = True
                 total += max(limit - used, 0)
         return total if found else None
     except Exception:
         return None
+
+
+def credits_summary(acc):
+    """查询当前积分余额；查不到返回 None。"""
+    status, text = _post(EP_ENTITLE, ug_headers(acc['accessToken'], acc.get('deviceId')),
+                         '{"require_usage": true}', 15)
+    try:
+        return parse_credits(json.loads(text))
+    except Exception:
+        return None
+
+
+def fetch_credits(acc, cache=None):
+    """实时查积分，token 过期时续期一次再查；全程失败返回 None。"""
+    def query():
+        status, text = _post(EP_ENTITLE, ug_headers(acc['accessToken'], acc.get('deviceId')),
+                             '{"require_usage": true}', 15)
+        try:
+            return parse_credits(json.loads(text)), status
+        except Exception:
+            return None, status
+
+    value, status = query()
+    if value is not None:
+        return value
+    if not acc.get('refreshToken'):
+        return None
+    if not (status in AUTH_FAIL_CODES or status in (401, 403)):
+        return None
+    ok, _msg = ensure_token(acc, cache if cache is not None else load_cache())
+    if not ok:
+        return None
+    value, _status = query()
+    return value
 
 
 # ══════════════════ 推送 ══════════════════

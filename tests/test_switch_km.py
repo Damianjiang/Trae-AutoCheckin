@@ -276,5 +276,31 @@ class DeviceIdentityTests(unittest.TestCase):
         self.assertNotIn("accessToken", acc)
 
 
+class CreditParseTests(unittest.TestCase):
+    """积分解析：usage_summary 优先，包列表兜底（面板「刷新」用这条链）。"""
+
+    def test_usage_summary(self):
+        payload = {"usage_summary": {"total_amount": 500, "consumed_amount": 120.5}}
+        self.assertAlmostEqual(CHECKIN.parse_credits(payload), 379.5)
+
+    def test_data_wrapper(self):
+        payload = {"data": {"usage_summary": {"total_amount": 10, "consumed_amount": 4}}}
+        self.assertAlmostEqual(CHECKIN.parse_credits(payload), 6)
+
+    def test_pack_list_fallback(self):
+        payload = {"user_entitlement_pack_list": [
+            {"entitlement_base_info": {"quota": {"credits_limit": 100}},
+             "usage": {"credits_amount": 30}},
+            {"entitlement_base_info": {"quota": {"credits_limit": 50}},
+             "usage": {"credits_amount": 50}},
+        ]}
+        self.assertAlmostEqual(CHECKIN.parse_credits(payload), 70)
+
+    def test_missing_returns_none(self):
+        self.assertIsNone(CHECKIN.parse_credits({}))
+        self.assertIsNone(CHECKIN.parse_credits({"usage_summary": {"total_amount": 0}}))
+        self.assertIsNone(CHECKIN.parse_credits(None))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

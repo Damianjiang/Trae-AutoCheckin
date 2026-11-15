@@ -1266,19 +1266,21 @@ class App(tk.Tk):
             rec = done.get(key)
             left = cooldown_left(cooldowns.get(key))
             tag = 'pending'
+            live = (acc.get('credits')
+                    if str(acc.get('creditsDate') or '') == today_str() else None)
             if not acc.get('enabled', True):
                 state_text, credits, tag = '已停用', '-', 'off'
             elif rec:
                 state_text = '已签到'
-                credits = self._fmt_credits(rec.get('credits'))
+                credits = self._fmt_credits(live if live is not None else rec.get('credits'))
                 tag = 'done'
             elif left > 0:
                 state_text = '冷却中 %d 分' % ((left + 59) // 60)
-                credits = '-'
+                credits = self._fmt_credits(live) if live is not None else '-'
                 tag = 'fail'
             else:
                 state_text = '待签到'
-                credits = '-'
+                credits = self._fmt_credits(live) if live is not None else '-'
             ref = str(acc.get('refreshToken') or '')
             shown = ref if self.var_show_tokens.get() else mask_token(ref)
             name = str(acc.get('name') or '账号%d' % (idx + 1))
@@ -2017,7 +2019,7 @@ class App(tk.Tk):
                                     'error': '', 'lines': lines}))
 
     def refresh_list(self):
-        """整表刷新：重新读配置，同步续期后的 token，补齐绑定，重画列表。"""
+        """整表刷新：先重画本地状态，再去服务端拉一次实时积分。"""
         if self.running or self.web_running or self.switching:
             self.log_ui('有任务在进行，稍后再刷新', 'warn')
             return
@@ -2026,8 +2028,57 @@ class App(tk.Tk):
         self._auto_bind_accounts()
         self.refresh_status()
         self.refresh_live_account()
-        self.var_footer.set('列表已刷新 · %s' % bj_now().strftime('%H:%M:%S'))
-        self.log_ui('列表已刷新（%d 个账号）' % len(self.cfg.get('accounts') or []), 'dim')
+        self.log_ui('列表已刷新（%d 个账号），正在拉取实时积分…'
+                    % len(self.cfg.get('accounts') or []), 'dim')
+        self._refresh_credits()
+
+    def _refresh_credits(self):
+        """后台拉取每个账号的实时积分（列表里的数字来自签到当时的记录，不会自己变）。"""
+        accounts = [dict(a) for a in self.cfg.get('accounts', []) if a.get('enabled', True)]
+        accounts = [a for a in accounts if a.get('accessToken') or a.get('refreshToken')]
+        if not accounts:
+            return
+        self.var_chip_status.set('正在刷新积分 0/%d…' % len(accounts))
+        threading.Thread(target=self._credits_worker, args=(accounts,), daemon=True).start()
+
+    def _credits_worker(self, accounts):
+        try:
+            import trae_checkin as checkin
+            cache = checkin.load_cache()
+        except Exception:                                   # noqa: BLE001
+            checkin, cache = None, {}
+        total = len(accounts)
+        for index, acc in enumerate(accounts, 1):
+            value = None
+            if checkin is not None:
+                try:
+                    value = checkin.fetch_credits(acc, cache)
+                except Exception:                            # noqa: BLE001
+                    value = None
+            self.msgq.put(('credits', {'index': index, 'total': total,
+                                       'uid': str(acc.get('uid') or ''),
+                                       'name': acc.get('name'), 'value': value}))
+
+    def _on_credits(self, payload):
+        uid = str(payload.get('uid') or '')
+        name = payload.get('name')
+        value = payload.get('value')
+        if value is not None:
+            for acc in self.cfg.get('accounts', []):
+                matched = ((uid and str(acc.get('uid') or '') == uid)
+                           or (not uid and str(acc.get('name') or '') == name))
+                if matched:
+                    acc['credits'] = round(float(value), 2)
+                    acc['creditsDate'] = today_str()
+                    break
+        index = int(payload.get('index') or 0)
+        total = int(payload.get('total') or 0)
+        if index >= total:
+            self.refresh_status()
+            self._sync_tokens_from_cache()
+            self.var_footer.set('积分已刷新 · %s' % bj_now().strftime('%H:%M:%S'))
+        else:
+            self.var_chip_status.set('正在刷新积分 %d/%d…' % (index, total))
 
     def _sync_tokens_from_cache(self):
         """把签到进程续期后的新 token 合并回面板配置。
@@ -2261,6 +2312,8 @@ class App(tk.Tk):
                     self._on_web_done(payload)
                 elif kind == 'switch_done':
                     self._on_switch_done(payload)
+                elif kind == 'credits':
+                    self._on_credits(payload)
         except queue.Empty:
             pass
         self.after(120, self._pump)
