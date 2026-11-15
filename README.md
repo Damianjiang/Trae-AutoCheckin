@@ -12,6 +12,10 @@ Windows 桌面面板 + 纯命令行两种用法，零第三方依赖，只要有
 ![Deps](https://img.shields.io/badge/dependencies-none-2ea44f)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 
+<p align="center">
+  <img src="screenshots/01-account-list-dark.png" alt="账号列表（深色主题）" width="860">
+</p>
+
 ---
 
 ## 能做什么
@@ -25,6 +29,22 @@ Windows 桌面面板 + 纯命令行两种用法，零第三方依赖，只要有
 | 账号绑定 | 每个号绑定到具体客户端（Trae CN / SOLO CN）并带上设备密钥，专治 20403 |
 | 推送通知 | 企业微信机器人 / PushPlus，签到结果直达手机 |
 | 深浅色面板 | 卡片式界面，深色/浅色一键切换，选择会记住；「刷新」会去服务端拉最新积分 |
+
+---
+
+## 界面预览
+
+| 添加账号（二选一） | 浏览器授权中 |
+| :--: | :--: |
+| <img src="screenshots/03-add-account.png" width="360"> | <img src="screenshots/04-auth-waiting.png" width="300"> |
+
+| 右键菜单 | 定时与补签 |
+| :--: | :--: |
+| <img src="screenshots/02-row-menu.png" width="150"> | <img src="screenshots/05-settings-schedule.png" width="430"> |
+
+| 推送与设备密钥 | 浅色主题 |
+| :--: | :--: |
+| <img src="screenshots/06-settings-device.png" width="430"> | <img src="screenshots/07-account-list-light.png" width="430"> |
 
 ---
 

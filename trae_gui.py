@@ -52,7 +52,7 @@ except Exception:                                    # noqa: BLE001
     SWITCH = None
 
 APP_TITLE = 'Trae 自动签到'
-APP_VERSION = 'v1.2.2'
+APP_VERSION = 'v1.2.3'
 UI_FONT = 'Microsoft YaHei UI'
 
 BJ_TZ = timezone(timedelta(hours=8))   # 与 trae_checkin.py 的北京时间保持一致
