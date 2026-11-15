@@ -519,6 +519,7 @@ class App(tk.Tk):
         self.retry_date = today_str()
         self._run_interactive = False
         self._pending_run = None
+        self._auto_fail_at = None
 
         self.title('%s %s' % (APP_TITLE, APP_VERSION))
         self.geometry('1100x780')
@@ -808,6 +809,7 @@ class App(tk.Tk):
         self._button(left, '删除', self.delete_account, kind='danger').pack(
             side='left', padx=(8, 0))
         self._button(left, '启用/停用', self.toggle_account).pack(side='left', padx=(8, 0))
+        self._button(left, '刷新', self.refresh_list).pack(side='left', padx=(8, 0))
 
         right = self._frame(bar, 'card')
         right.pack(side='right', padx=16, pady=10)
@@ -2014,6 +2016,19 @@ class App(tk.Tk):
         self.msgq.put(('run_done', {'code': proc.returncode, 'reason': reason,
                                     'error': '', 'lines': lines}))
 
+    def refresh_list(self):
+        """整表刷新：重新读配置，同步续期后的 token，补齐绑定，重画列表。"""
+        if self.running or self.web_running or self.switching:
+            self.log_ui('有任务在进行，稍后再刷新', 'warn')
+            return
+        self.cfg = self.load_config()
+        self._sync_tokens_from_cache()
+        self._auto_bind_accounts()
+        self.refresh_status()
+        self.refresh_live_account()
+        self.var_footer.set('列表已刷新 · %s' % bj_now().strftime('%H:%M:%S'))
+        self.log_ui('列表已刷新（%d 个账号）' % len(self.cfg.get('accounts') or []), 'dim')
+
     def _sync_tokens_from_cache(self):
         """把签到进程续期后的新 token 合并回面板配置。
 
@@ -2150,12 +2165,23 @@ class App(tk.Tk):
                 self.save_config(silent=True)
                 self.log_ui('今日账号均已签到，跳过定时任务', 'dim')
             elif sch['catchUp'] or now < sched_today + timedelta(minutes=15):
-                self.cfg['lastAutoDate'] = today
-                self.save_config(silent=True)
-                self.log_ui('到达定时时间 %02d:%02d，开始自动签到' % (hhmm[0], hhmm[1]), 'head')
-                if not self.start_run('每日定时 %02d:%02d' % (hhmm[0], hhmm[1]),
-                                      interactive=False):
-                    self.log_ui('自动签到未能启动（账号或配置不完整）', 'err')
+                # 只有真的启动成功才记 lastAutoDate；失败留到 5 分钟后再试，
+                # 否则一次配置问题就会把当天的自动签到吞掉。
+                if (self._auto_fail_at
+                        and (now - self._auto_fail_at) < timedelta(minutes=5)):
+                    pass
+                else:
+                    started = self.start_run('每日定时 %02d:%02d' % (hhmm[0], hhmm[1]),
+                                             interactive=False)
+                    if started:
+                        self.cfg['lastAutoDate'] = today
+                        self.save_config(silent=True)
+                        self._auto_fail_at = None
+                        self.log_ui('到达定时时间 %02d:%02d，已开始自动签到'
+                                    % (hhmm[0], hhmm[1]), 'head')
+                    else:
+                        self._auto_fail_at = now
+                        self.log_ui('自动签到没能启动（账号或配置不完整），5 分钟后重试', 'err')
 
         if self.retry_at and not self.running and bj_now() >= self.retry_at:
             self.retry_at = None

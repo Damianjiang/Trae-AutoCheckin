@@ -46,7 +46,8 @@ Trae AutoCheckin · Trae 每日自动签到（抗 9074 限流版）
   TRAE_STORAGE_PATH        storage.json 路径（可选，自动读取并解密）
   TRAE_DEVICE_ID[_N]       设备号（可选；优先用客户端真实设备号，本机读不到时才用这个值）
   TRAE_BATCH               每轮签几个账号（可选，默认 all 一轮全签；设 1 按小时轮换）
-  TRAE_JITTER              启动随机抖动（可选，默认开；设 0 关闭 0~20s 错峰等待）
+  TRAE_JITTER              启动随机抖动（可选，默认关；设 1 开启 0~20s 等待）
+  TRAE_GAP_SEC             账号之间的间隔秒数（可选，默认 1）
   TRAE_COOLDOWN_MIN        平时 9074 冷却分钟数（可选，默认 55）
   TRAE_PEAK_HOURS          早窗小时（可选，默认 0；支持 0 / 0,23 / 0-1）
   TRAE_PEAK_COOLDOWN_MIN   早窗内冷却分钟数（可选，默认 12）
@@ -790,18 +791,6 @@ def local_device_identities():
                           'publicKeyPem': pub, 'machineId': machine_id,
                           'uid': uid, 'product': product, 'from': sp})
     return found
-
-
-def local_device_keys(device_id=''):
-    """本机客户端注册过的设备身份；传 device_id 时优先精确匹配那台设备。"""
-    identities = local_device_identities()
-    target = str(device_id or '').strip()
-    if target:
-        for item in identities:
-            if item['deviceId'] == target:
-                return item
-    return identities[0] if identities else None
-
 
 def norm_pem(v):
     """把环境变量里字面量的 \\n 还原成真换行（复制粘贴友好）。"""
@@ -1622,7 +1611,7 @@ SOFT = ('待重试',)               # 限流类，冷却到点由 cron 补签，
 DEAD = ('未开放', '鉴权失败')      # 需要人工处理
 COOLDOWN_MIN = 55                # 平时 9074 冷却分钟数（实测 8 小时后仍未解除，一小时一试）
 PEAK_COOLDOWN_MIN = 12           # 早窗内的短冷却，好让下一轮还在窗口里补签
-GAP_MIN, GAP_MAX = 12, 25        # 实测 25s 间隔可让相邻账号连续签到成功
+GAP_MIN, GAP_MAX = 1, 1          # 账号之间固定错开 1 秒（TRAE_GAP_SEC 可改）
 
 
 def main():
@@ -1658,17 +1647,22 @@ def main():
     if len(batch) < len(pending):
         names = '、'.join(a.get('_name') or a.get('name') or _acct_key(a) for a in batch)
         print('🎚  [轮签] 本轮只签 %s（其余交给后续 cron，避开整点排队限流）' % names)
-    if batch and os.getenv('TRAE_JITTER', '1').strip() != '0':
+    if batch and os.getenv('TRAE_JITTER', '0').strip() not in ('0', '', 'off'):
         wait = random.randint(0, 20)
         print('🎲 [错峰] 随机等待 %d 秒再请求…' % wait)
         time.sleep(wait)
 
+    # 账号间隔：默认 1 秒（TRAE_GAP_SEC 可调），让相邻请求不完全同时到达
+    try:
+        gap_base = max(1, int(os.getenv('TRAE_GAP_SEC', '1').strip() or 1))
+    except ValueError:
+        gap_base = 1
     prev_claimed = False
     for idx, acc in enumerate(batch):
         # 只有上一次真的发过 claim 才需要错峰；纯只读的 status 查询不必等待，
         # 否则"全部已签到"的巡检也要白等一分多钟。
         if idx > 0 and prev_claimed:
-            gap = random.randint(GAP_MIN, GAP_MAX)
+            gap = gap_base + random.choice((0, 0, 1))
             print('\n⏳ [间隔] 等待 %d 秒后处理下一个账号...' % gap)
             time.sleep(gap)
         try:

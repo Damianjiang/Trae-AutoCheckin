@@ -12,9 +12,7 @@ import os
 import secrets
 import socket
 import sys
-import threading
 import time
-import urllib.parse
 import webbrowser
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -152,29 +150,10 @@ def load_device(key='default', create=True):
     _write_devices(devices)
     return dev
 
-
-def save_device(key, dev):
-    key = str(key or 'default').strip() or 'default'
-    devices = _read_devices()
-    devices[key] = dev
-    _write_devices(devices)
-    return dev
-
-
 def list_devices():
     return [{'key': k, 'device_id': (v or {}).get('device_id', ''),
              'created_at': (v or {}).get('created_at', '')}
             for k, v in sorted(_read_devices().items())]
-
-
-def delete_device(key):
-    devices = _read_devices()
-    if key in devices:
-        devices.pop(key)
-        _write_devices(devices)
-        return True
-    return False
-
 
 def as_sl_device(dev):
     """转换成 trae_sms_login 期待的形状（snake_case、public_key 必填）。"""

@@ -126,11 +126,6 @@ def aes_cbc_encrypt(key, iv, data):
     return bytes(out)
 
 
-def aes_cbc_decrypt(key, iv, data):
-    """无填充 CBC 解密（与 trae_checkin 的实现一致，便于交叉校验）。"""
-    return _decrypt_blocks(key, iv, data)
-
-
 # ── 解密：自带实现，绝不 import trae_checkin ──
 # 早先这里 `from trae_checkin import aes128_cbc_decrypt`，而 trae_checkin 执行时是
 # `__main__`，再导入一次会生成第二个模块实例并重复跑它的配置层（日志里那两条
@@ -187,10 +182,6 @@ def _decrypt_blocks(key, iv, data):
 
 
 # Km 编解码
-def is_km_value(value):
-    return str(value or '').startswith(KM_PREFIX)
-
-
 def derive_key_iv(salt):
     seed_hash = hashlib.sha512(salt).digest()
     digest = hashlib.sha512(seed_hash + MIXED).digest()
