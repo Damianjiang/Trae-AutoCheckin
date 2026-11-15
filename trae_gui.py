@@ -26,7 +26,7 @@ import traceback
 from datetime import datetime, timedelta, timezone
 
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 
 # ══════════════════════════════════════════════════════════════
 # 常量与路径
@@ -52,7 +52,7 @@ except Exception:                                    # noqa: BLE001
     SWITCH = None
 
 APP_TITLE = 'Trae 自动签到'
-APP_VERSION = 'v1.2.0'
+APP_VERSION = 'v1.2.1'
 UI_FONT = 'Microsoft YaHei UI'
 
 BJ_TZ = timezone(timedelta(hours=8))   # 与 trae_checkin.py 的北京时间保持一致
@@ -494,6 +494,69 @@ class AccountDialog(tk.Toplevel):
 
 
 # ══════════════════════════════════════════════════════════════
+# 添加账号：先选入口（手动 / 浏览器）
+# ══════════════════════════════════════════════════════════════
+class AddAccountDialog(tk.Toplevel):
+    """两个入口：手动填凭据，或直接打开浏览器授权登录后自动入库。"""
+
+    def __init__(self, master):
+        super().__init__(master)
+        self.t = master.t
+        self.result = None
+        self.title('添加账号')
+        self.configure(bg=self.t['card'])
+        self.resizable(False, False)
+        self.transient(master)
+
+        tk.Label(self, text='选择添加方式', bg=self.t['card'], fg=self.t['text'],
+                 font=(UI_FONT, 12, 'bold')).pack(anchor='w', padx=20, pady=(16, 2))
+        tk.Label(self, text='从浏览器获取：打开官网授权页，用手机号 + 验证码登录，成功后自动入库。\n'
+                            '手动填写：粘贴别处导出的 refreshToken。',
+                 bg=self.t['card'], fg=self.t['muted'], font=(UI_FONT, 9),
+                 justify='left').pack(anchor='w', padx=20, pady=(0, 14))
+
+        row = tk.Frame(self, bg=self.t['card'])
+        row.pack(fill='x', padx=20)
+        self._big_button(row, '从浏览器获取', '（推荐）', lambda: self._pick('web'),
+                         primary=True).pack(side='left', fill='x', expand=True)
+        self._big_button(row, '手动填写', '（粘贴凭据）', lambda: self._pick('manual'),
+                         primary=False).pack(side='left', fill='x', expand=True, padx=(10, 0))
+
+        bar = tk.Frame(self, bg=self.t['card'])
+        bar.pack(fill='x', padx=20, pady=(14, 16))
+        tk.Button(bar, text='取消', command=self.destroy, bg=self.t['btn_bg'],
+                  fg=self.t['btn_fg'], activebackground=self.t['btn_hover'],
+                  activeforeground=self.t['btn_fg'], relief='flat', bd=0, padx=16, pady=5,
+                  cursor='hand2', font=(UI_FONT, 9), highlightthickness=0).pack(side='right')
+
+        self._center(master)
+        self.grab_set()
+        self.bind('<Escape>', lambda e: self.destroy())
+        self.wait_window(self)
+
+    def _big_button(self, parent, text, hint, command, primary):
+        bg = self.t['accent'] if primary else self.t['btn_bg']
+        fg = self.t['accent_fg'] if primary else self.t['btn_fg']
+        hover = self.t['accent_hover'] if primary else self.t['btn_hover']
+        btn = tk.Button(parent, command=command, bg=bg, fg=fg, activebackground=hover,
+                        activeforeground=fg, relief='flat', bd=0, padx=14, pady=10,
+                        cursor='hand2', font=(UI_FONT, 10), highlightthickness=0)
+        btn.configure(text='%s\n%s' % (text, hint), justify='center')
+        return btn
+
+    def _pick(self, value):
+        self.result = value
+        self.destroy()
+
+    def _center(self, master):
+        self.update_idletasks()
+        w, h = self.winfo_reqwidth(), self.winfo_reqheight()
+        x = master.winfo_rootx() + (master.winfo_width() - w) // 2
+        y = master.winfo_rooty() + (master.winfo_height() - h) // 3
+        self.geometry('+%d+%d' % (max(x, 0), max(y, 0)))
+
+
+# ══════════════════════════════════════════════════════════════
 # 主界面
 # ══════════════════════════════════════════════════════════════
 class App(tk.Tk):
@@ -520,6 +583,7 @@ class App(tk.Tk):
         self._run_interactive = False
         self._pending_run = None
         self._auto_fail_at = None
+        self._credits_pending = False
 
         self.title('%s %s' % (APP_TITLE, APP_VERSION))
         self.geometry('1100x780')
@@ -543,6 +607,7 @@ class App(tk.Tk):
         self.refresh_status()
         self.refresh_live_account()
         self.after(300, self._auto_bind_accounts)
+        self.after(1500, self._refresh_credits)
         self.after(120, self._pump)
         self.after(1000, self._tick)
         if not selftest:
@@ -827,11 +892,9 @@ class App(tk.Tk):
         holder.pack(fill='both', expand=True)
         self.main_tabs = TabBar(self, holder)
         self.page_accounts = self.main_tabs.add('accounts', '账号列表')
-        self.page_web = self.main_tabs.add('web', '批量登录')
         self.page_settings = self.main_tabs.add('settings', '设置')
         self.page_log = self.main_tabs.add('log', '运行日志')
         self._build_accounts_page(self.page_accounts)
-        self._build_web_page(self.page_web)
         self._build_settings_page(self.page_settings)
         self._build_log_page(self.page_log)
         self.main_tabs.select('accounts')
@@ -877,52 +940,6 @@ class App(tk.Tk):
         self._label(bottom, '小提示：每个账号必须对应它自己的客户端设备号；'
                             '缺设备号时点「读取本机账号」自动同步。双击一行可编辑。',
                     fg='muted', font=(UI_FONT, 8), justify='left').pack(side='left')
-
-    # ---------- 批量登录页（网页授权 · 免客户端） ----------
-    def _build_web_page(self, page):
-        body = self._section(page, '要登录的账号')
-        self._label(
-            body, '每行一个账号名（只作备注，方便区分）。点「开始批量登录」后浏览器会依次打开'
-                  '官网授权页，用对应账号的手机号 + 验证码登录即可，凭据会自动抓进账号列表。\n'
-                  '整个流程不会启动、也不会关闭你的 Trae 客户端（换号请回「账号列表」点'
-                  '「切换到此账号」）。',
-            fg='muted', bg='card', font=(UI_FONT, 8), justify='left').pack(anchor='w', pady=(0, 8))
-
-        row = self._frame(body, 'card')
-        row.pack(fill='both', expand=True)
-        self.txt_web_names = self._text(row, kind='input', height=6, wrap='none',
-                                        font=(UI_FONT, 10))
-        self.txt_web_names.pack(side='left', fill='both', expand=True)
-        ops = self._frame(row, 'card')
-        ops.pack(side='left', fill='y', padx=(10, 0))
-        self.btn_web_start = self._button(ops, '开始批量登录', self.start_web_login,
-                                          kind='primary')
-        self.btn_web_start.pack(fill='x')
-        self.btn_web_stop = self._button(ops, '中止', self.stop_web_login)
-        self.btn_web_stop.pack(fill='x', pady=(8, 0))
-        self.btn_web_stop.configure(state='disabled')
-        self._button(ops, '填入现有账号', self.fill_web_names).pack(fill='x', pady=(8, 0))
-
-        opts = self._frame(body, 'card')
-        opts.pack(fill='x', pady=(10, 0))
-        self._label(opts, '单号超时', bg='card').pack(side='left')
-        self.var_web_timeout = tk.StringVar(value='300')
-        self._entry(opts, self.var_web_timeout, width=6).pack(side='left', padx=6)
-        self._label(opts, '秒', bg='card').pack(side='left')
-        self.var_web_checkin = tk.BooleanVar(value=True)
-        self._check(opts, '登录完成后自动签到', self.var_web_checkin).pack(side='left', padx=(18, 0))
-        self.var_web_switch = tk.BooleanVar(value=False)
-        self._check(opts, '登录后把客户端切到该账号', self.var_web_switch).pack(
-            side='left', padx=(12, 0))
-
-        status = self._section(page, '进度')
-        self.var_web_status = tk.StringVar(value='空闲')
-        self._label(status, textvariable=self.var_web_status, bg='card',
-                    font=(UI_FONT, 10)).pack(anchor='w')
-        self._label(status, '浏览器里出现「登录成功」页就可以关掉标签页了；进度与详细过程看'
-                            '「运行日志」。授权页没自动弹出时，从日志里复制链接手动打开。',
-                    fg='muted', bg='card', font=(UI_FONT, 8),
-                    justify='left').pack(anchor='w', pady=(6, 0))
 
     # ---------- 设置页 ----------
     def _build_settings_page(self, page):
@@ -1281,6 +1298,8 @@ class App(tk.Tk):
             else:
                 state_text = '待签到'
                 credits = self._fmt_credits(live) if live is not None else '-'
+            if self._credits_pending and acc.get('enabled', True):
+                credits = '…'      # 正在拉新余额：先别显示旧缓存，避免数字闪一下再变
             ref = str(acc.get('refreshToken') or '')
             shown = ref if self.var_show_tokens.get() else mask_token(ref)
             name = str(acc.get('name') or '账号%d' % (idx + 1))
@@ -1353,121 +1372,6 @@ class App(tk.Tk):
         if total and done < total and self.cfg.get('lastAutoDate') == today_str():
             self.var_footer.set('有账号今天还没签到，可点「立即签到」补上')
         self._update_chips()
-
-    # ---------- 批量登录（网页授权） ----------
-    def fill_web_names(self):
-        names = [str(a.get('name') or '').strip() for a in self.cfg.get('accounts', [])]
-        names = [n for n in names if n]
-        self.txt_web_names.delete('1.0', 'end')
-        self.txt_web_names.insert('1.0', '\n'.join(names or ['账号A', '账号B']))
-
-    def start_web_login(self):
-        if WEB is None:
-            messagebox.showerror('缺少模块', '同目录下找不到 trae_weblogin.py，无法网页登录。',
-                                 parent=self)
-            return
-        if self.web_running:
-            messagebox.showinfo('正在进行', '上一批登录还没结束，请稍候…', parent=self)
-            return
-        names = []
-        for line in text_get(self.txt_web_names).splitlines():
-            name = line.strip()
-            if name and name not in names:
-                names.append(name)
-        if not names:
-            messagebox.showwarning('没有账号', '请先在上面填账号名，每行一个。', parent=self)
-            return
-        try:
-            timeout = int(str(self.var_web_timeout.get()).strip())
-        except Exception:
-            timeout = 300
-        timeout = max(60, min(1800, timeout))
-        self.web_running = True
-        self.web_stop.clear()
-        self.btn_web_start.configure(state='disabled', text='登录中…')
-        self.btn_web_stop.configure(state='normal')
-        self.var_web_status.set('准备中…共 %d 个账号' % len(names))
-        self.log_ui('', 'dim')
-        self.log_ui('▶ 开始批量网页登录：%d 个账号（不触碰客户端）' % len(names), 'head')
-        threading.Thread(
-            target=self._web_worker,
-            args=(names, timeout, bool(self.var_web_checkin.get()),
-                  bool(self.var_web_switch.get())), daemon=True).start()
-
-    def stop_web_login(self):
-        if not self.web_running:
-            return
-        self.web_stop.set()
-        self.var_web_status.set('正在中止…（当前这个账号的浏览器可以关掉）')
-        self.log_ui('已请求中止批量登录', 'warn')
-
-    def _web_worker(self, names, timeout, auto_checkin, switch_last):
-        def log(text, level='dim'):
-            self.msgq.put(('log', text))
-
-        def on_result(name, res):
-            if res.get('ok') and res.get('account'):
-                self.msgq.put(('web_account', {'name': name, 'account': res['account']}))
-
-        try:
-            summary = WEB.run_batch(names, timeout=timeout, log=log,
-                                    stop=self.web_stop, on_result=on_result)
-        except Exception as exc:                           # noqa: BLE001
-            log('批量登录异常：%s' % exc, 'err')
-            summary = {'ok': 0, 'fail': len(names), 'total': len(names), 'results': []}
-        self.msgq.put(('web_done', {'summary': summary, 'autoCheckin': auto_checkin,
-                                    'switchLast': switch_last}))
-
-    def _on_web_account(self, payload):
-        acc = dict(payload.get('account') or {})
-        if not acc.get('refreshToken'):
-            return
-        accounts = self.cfg.setdefault('accounts', [])
-        uid = str(acc.get('uid') or '')
-        token_key = str(acc.get('refreshToken') or '')[:24]
-        target = None
-        for item in accounts:
-            if uid and str(item.get('uid') or '') == uid:
-                target = item
-                break
-            if token_key and str(item.get('refreshToken') or '')[:24] == token_key:
-                target = item
-                break
-        if target is None:
-            accounts.append(acc)
-            text = '已新增账号：%s' % (acc.get('name') or acc.get('uid'))
-        else:
-            for key in ('refreshToken', 'accessToken', 'deviceId', 'realDeviceId',
-                        'deviceKeyPem', 'devicePubPem', 'machineId', 'oauthDevice',
-                        'source', 'username'):
-                if acc.get(key):
-                    target[key] = acc[key]
-            if not str(target.get('name') or '').strip():
-                target['name'] = acc.get('name')
-            text = '已更新账号：%s' % (target.get('name') or target.get('uid'))
-        self._last_web_account = acc.get('name') or acc.get('uid')
-        self._after_accounts_changed(text)
-
-    def _on_web_done(self, payload):
-        self.web_running = False
-        self.btn_web_start.configure(state='normal', text='开始批量登录')
-        self.btn_web_stop.configure(state='disabled')
-        summary = payload.get('summary') or {}
-        ok = int(summary.get('ok') or 0)
-        fail = int(summary.get('fail') or 0)
-        text = '批量登录结束：成功 %d 个，失败 %d 个' % (ok, fail)
-        self.var_web_status.set(text)
-        self.log_ui('⏹ ' + text, 'ok' if fail == 0 else 'warn')
-        if self.web_stop.is_set():
-            self.log_ui('（已中止，未完成的账号下次再登）', 'dim')
-        if ok and payload.get('switchLast'):
-            name = getattr(self, '_last_web_account', '')
-            if name:
-                self.log_ui('按设置把客户端切到「%s」…' % name, 'head')
-                self.after(200, lambda n=name: self._switch_by_name(n))
-        if ok and payload.get('autoCheckin'):
-            self.log_ui('按设置开始签到（只签今天还没签的账号）…', 'head')
-            self.after(400, lambda: self.start_run('网页登录后', interactive=False, sync=False))
 
     # ---------- 切换客户端账号（冷切换） ----------
     def _switch_by_name(self, name):
@@ -1597,11 +1501,93 @@ class App(tk.Tk):
             self.var_live_account.set('客户端当前：未登录')
 
     def add_account(self):
-        dlg = AccountDialog(self, None, self._next_default_name())
-        if not dlg.result:
+        choice = AddAccountDialog(self).result
+        if choice == 'manual':
+            dlg = AccountDialog(self, None, self._next_default_name())
+            if dlg.result:
+                self.cfg.setdefault('accounts', []).append(dlg.result)
+                self._after_accounts_changed('已添加账号：%s' % dlg.result.get('name'))
+        elif choice == 'web':
+            self.login_from_browser()
+
+    def login_from_browser(self):
+        """打开官网授权页登录一个号，成功后自动入库。"""
+        if WEB is None:
+            messagebox.showerror('缺少模块', '同目录下找不到 trae_weblogin.py，无法浏览器登录。',
+                                 parent=self)
             return
-        self.cfg.setdefault('accounts', []).append(dlg.result)
-        self._after_accounts_changed('已添加账号：%s' % dlg.result.get('name'))
+        if self.web_running:
+            messagebox.showinfo('正在进行', '上一次浏览器登录还没结束，请稍候…', parent=self)
+            return
+        name = simpledialog.askstring(
+            '从浏览器获取', '给这个账号起个备注名（只影响面板显示）：',
+            initialvalue=self._next_default_name(), parent=self)
+        if not name or not name.strip():
+            return
+        name = name.strip()
+        self.web_running = True
+        self.web_stop.clear()
+        self.var_chip_status.set('等待浏览器授权…')
+        self.log_ui('', 'dim')
+        self.log_ui('▶ 打开浏览器登录「%s」，用手机号 + 验证码完成授权' % name, 'head')
+        threading.Thread(target=self._web_login_worker, args=(name, 300),
+                         daemon=True).start()
+
+    def _web_login_worker(self, name, timeout):
+        def log(text, level='dim'):
+            self.msgq.put(('log', text))
+        try:
+            res = WEB.web_login(name=name, timeout=timeout, log=log, stop=self.web_stop)
+        except Exception as exc:                            # noqa: BLE001
+            res = {'ok': False, 'error': '登录异常：%s' % exc, 'account': None}
+        self.msgq.put(('web_login_done', {'name': name, 'result': res}))
+
+    def _on_web_login_done(self, payload):
+        self.web_running = False
+        self._update_chips()
+        res = payload.get('result') or {}
+        name = str(payload.get('name') or '')
+        if res.get('ok') and res.get('account'):
+            self._merge_account(res['account'])
+            self.var_footer.set('已添加账号 · %s' % name)
+            messagebox.showinfo('添加成功', '已添加「%s」，可以直接签到了。'
+                                % (res['account'].get('name') or name), parent=self)
+            return
+        err = res.get('error') or '未知原因'
+        self.log_ui('❌ 浏览器登录失败：%s' % err, 'err')
+        self.var_footer.set('浏览器登录失败')
+        messagebox.showwarning('登录失败', err, parent=self)
+
+    def _merge_account(self, account):
+        """把新登录/导入的账号并入配置：同 uid 或同 token 视为同一个号，只更新凭据。"""
+        acc = dict(account or {})
+        if not acc.get('refreshToken'):
+            return False
+        accounts = self.cfg.setdefault('accounts', [])
+        uid = str(acc.get('uid') or '')
+        token_key = str(acc.get('refreshToken') or '')[:24]
+        target = None
+        for item in accounts:
+            if uid and str(item.get('uid') or '') == uid:
+                target = item
+                break
+            if token_key and str(item.get('refreshToken') or '')[:24] == token_key:
+                target = item
+                break
+        if target is None:
+            accounts.append(acc)
+            text = '已新增账号：%s' % (acc.get('name') or acc.get('uid'))
+        else:
+            for key in ('refreshToken', 'accessToken', 'deviceId', 'realDeviceId',
+                        'deviceKeyPem', 'devicePubPem', 'machineId', 'oauthDevice',
+                        'source', 'username'):
+                if acc.get(key):
+                    target[key] = acc[key]
+            if not str(target.get('name') or '').strip():
+                target['name'] = acc.get('name')
+            text = '已更新账号：%s' % (target.get('name') or target.get('uid'))
+        self._after_accounts_changed(text)
+        return True
 
     def edit_account(self):
         sel = self.tree.selection()
@@ -2024,6 +2010,7 @@ class App(tk.Tk):
             self.log_ui('有任务在进行，稍后再刷新', 'warn')
             return
         self.cfg = self.load_config()
+        self._credits_pending = True        # 先挂「刷新中」，避免旧积分闪一下
         self._sync_tokens_from_cache()
         self._auto_bind_accounts()
         self.refresh_status()
@@ -2033,11 +2020,13 @@ class App(tk.Tk):
         self._refresh_credits()
 
     def _refresh_credits(self):
-        """后台拉取每个账号的实时积分（列表里的数字来自签到当时的记录，不会自己变）。"""
+        """后台拉取每个账号的实时积分，并写回配置（下次启动先用它，再自动刷新）。"""
         accounts = [dict(a) for a in self.cfg.get('accounts', []) if a.get('enabled', True)]
         accounts = [a for a in accounts if a.get('accessToken') or a.get('refreshToken')]
         if not accounts:
             return
+        self._credits_pending = True
+        self.refresh_status()
         self.var_chip_status.set('正在刷新积分 0/%d…' % len(accounts))
         threading.Thread(target=self._credits_worker, args=(accounts,), daemon=True).start()
 
@@ -2074,9 +2063,12 @@ class App(tk.Tk):
         index = int(payload.get('index') or 0)
         total = int(payload.get('total') or 0)
         if index >= total:
+            self._credits_pending = False
             self.refresh_status()
+            self.save_config(silent=True)      # 把最新积分存进配置，下次先用缓存
             self._sync_tokens_from_cache()
             self.var_footer.set('积分已刷新 · %s' % bj_now().strftime('%H:%M:%S'))
+            self.log_ui('积分已刷新并写入缓存', 'dim')
         else:
             self.var_chip_status.set('正在刷新积分 %d/%d…' % (index, total))
 
@@ -2112,6 +2104,7 @@ class App(tk.Tk):
         self.running = False
         self.btn_run.configure(state='normal', text='立即签到')
         self._sync_tokens_from_cache()
+        self._refresh_credits()
         if result.get('error'):
             self.log_ui('启动签到进程失败：%s' % result['error'], 'err')
             self.var_footer.set('签到进程启动失败')
@@ -2306,10 +2299,8 @@ class App(tk.Tk):
                     self._on_extract_accounts(payload)
                 elif kind == 'extract_keys':
                     self._on_extract_keys(payload)
-                elif kind == 'web_account':
-                    self._on_web_account(payload)
-                elif kind == 'web_done':
-                    self._on_web_done(payload)
+                elif kind == 'web_login_done':
+                    self._on_web_login_done(payload)
                 elif kind == 'switch_done':
                     self._on_switch_done(payload)
                 elif kind == 'credits':
