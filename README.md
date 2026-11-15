@@ -5,6 +5,8 @@ Windows 桌面面板 + 纯命令行两种用法，零第三方依赖，只要有
 
 **本项目由 AI 开发。**
 
+> 下载：[最新发行版](https://github.com/Damianjiang/Trae-AutoCheckin/releases/latest) —— 解压后双击 `启动签到面板.vbs` 即可，无需安装依赖。
+
 ![Python](https://img.shields.io/badge/Python-3.8%2B-3776ab?logo=python&logoColor=white)
 ![Platform](https://img.shields.io/badge/Windows-10%2F11-0078d4?logo=windows)
 ![Deps](https://img.shields.io/badge/dependencies-none-2ea44f)
