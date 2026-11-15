@@ -245,9 +245,10 @@ def serve_callback(port, timeout, on_params, stop=None):
 
 # 完整登录
 def web_login(name='', device_key='', timeout=300, open_browser=True, log=None,
-              stop=None, host=''):
+              stop=None, host='', on_url=None):
     """走完「授权 URL → 浏览器登录 → 回调 → 兑换」，返回可直接入库的账号。
 
+    on_url 会在生成授权链接后回调一次，方便界面提供「重新打开浏览器」。
     返回 {'ok','account','error','device_key','waited'}
     """
     device_key = str(device_key or '').strip() or (name or 'default')
@@ -256,6 +257,11 @@ def web_login(name='', device_key='', timeout=300, open_browser=True, log=None,
     trace_id = secrets.token_hex(16)
     verifier, challenge = SL.pkce_pair()
     url = build_url(dev, port, trace_id, challenge)
+    if on_url:
+        try:
+            on_url(url)
+        except Exception:
+            pass
 
     _log(log, '设备身份：%s（machineId %s…，自造密钥）'
          % (dev['device_id'], dev.get('machine_id', '')[:8]), 'dim')

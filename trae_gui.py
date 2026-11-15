@@ -52,7 +52,7 @@ except Exception:                                    # noqa: BLE001
     SWITCH = None
 
 APP_TITLE = 'Trae 自动签到'
-APP_VERSION = 'v1.2.1'
+APP_VERSION = 'v1.2.2'
 UI_FONT = 'Microsoft YaHei UI'
 
 BJ_TZ = timezone(timedelta(hours=8))   # 与 trae_checkin.py 的北京时间保持一致
@@ -557,6 +557,103 @@ class AddAccountDialog(tk.Toplevel):
 
 
 # ══════════════════════════════════════════════════════════════
+# 浏览器授权进度窗口
+# ══════════════════════════════════════════════════════════════
+class WebAuthDialog(tk.Toplevel):
+    """等浏览器授权时的进度窗：授权成功/失败/取消都会立刻关掉它。"""
+
+    def __init__(self, master, on_cancel=None, on_reopen=None):
+        super().__init__(master)
+        self.t = master.t
+        self._on_cancel = on_cancel
+        self._on_reopen = on_reopen
+        self._job = None
+        self._start = time.time()
+        self.title('正在授权')
+        self.configure(bg=self.t['card'])
+        self.resizable(False, False)
+        self.transient(master)
+
+        box = tk.Frame(self, bg=self.t['card'])
+        box.pack(fill='both', expand=True, padx=22, pady=18)
+        tk.Label(box, text='请在浏览器里完成登录', bg=self.t['card'], fg=self.t['text'],
+                 font=(UI_FONT, 12, 'bold')).pack(anchor='w')
+        tk.Label(box, text='已打开 Trae 官网授权页：输入手机号 → 获取验证码 → 登录。\n'
+                           '检测到授权完成后，本窗口会自动关闭并把账号加进列表。',
+                 bg=self.t['card'], fg=self.t['muted'], font=(UI_FONT, 9),
+                 justify='left').pack(anchor='w', pady=(6, 10))
+
+        self.var_status = tk.StringVar(value='等待授权…')
+        self.lab_status = tk.Label(box, textvariable=self.var_status, bg=self.t['card'],
+                                   fg=self.t['accent'], font=(UI_FONT, 10))
+        self.lab_status.pack(anchor='w')
+
+        self.var_elapsed = tk.StringVar(value='已等待 0 秒')
+        tk.Label(box, textvariable=self.var_elapsed, bg=self.t['card'], fg=self.t['muted'],
+                 font=(UI_FONT, 8)).pack(anchor='w', pady=(2, 12))
+
+        bar = tk.Frame(box, bg=self.t['card'])
+        bar.pack(fill='x')
+        tk.Button(bar, text='重新打开浏览器', command=self._reopen, bg=self.t['btn_bg'],
+                  fg=self.t['btn_fg'], activebackground=self.t['btn_hover'],
+                  activeforeground=self.t['btn_fg'], relief='flat', bd=0, padx=14, pady=6,
+                  cursor='hand2', font=(UI_FONT, 9), highlightthickness=0).pack(side='left')
+        tk.Button(bar, text='取消授权', command=self._cancel, bg=self.t['btn_bg'],
+                  fg=self.t['err'], activebackground=self.t['danger_hover'],
+                  activeforeground=self.t['err'], relief='flat', bd=0, padx=14, pady=6,
+                  cursor='hand2', font=(UI_FONT, 9), highlightthickness=0).pack(side='right')
+
+        self.protocol('WM_DELETE_WINDOW', self._cancel)
+        self._center(master)
+        self.lift()
+        self._tick()
+
+    def _center(self, master):
+        self.update_idletasks()
+        w, h = self.winfo_reqwidth(), self.winfo_reqheight()
+        x = master.winfo_rootx() + (master.winfo_width() - w) // 2
+        y = master.winfo_rooty() + (master.winfo_height() - h) // 3
+        self.geometry('+%d+%d' % (max(x, 0), max(y, 0)))
+
+    def _tick(self):
+        if not self.winfo_exists():
+            return
+        self.var_elapsed.set('已等待 %d 秒' % int(time.time() - self._start))
+        self._job = self.after(1000, self._tick)
+
+    def set_status(self, text, level='accent'):
+        if not self.winfo_exists():
+            return
+        self.var_status.set(text)
+        self.lab_status.configure(fg=self.t.get(level, self.t['accent']))
+
+    def _reopen(self):
+        if self._on_reopen:
+            try:
+                self._on_reopen()
+            except Exception:                                # noqa: BLE001
+                pass
+
+    def _cancel(self):
+        self.set_status('正在取消…', 'warn')
+        if self._on_cancel:
+            try:
+                self._on_cancel()
+            except Exception:                                # noqa: BLE001
+                pass
+
+    def close(self):
+        if self._job:
+            try:
+                self.after_cancel(self._job)
+            except Exception:                                # noqa: BLE001
+                pass
+            self._job = None
+        if self.winfo_exists():
+            self.destroy()
+
+
+# ══════════════════════════════════════════════════════════════
 # 主界面
 # ══════════════════════════════════════════════════════════════
 class App(tk.Tk):
@@ -575,6 +672,8 @@ class App(tk.Tk):
         self.extracting = False
         self.web_running = False
         self.web_stop = threading.Event()
+        self.web_dialog = None
+        self._web_url = ''
         self.switching = False
         self.msgq = queue.Queue()
         self.retry_at = None
@@ -812,6 +911,13 @@ class App(tk.Tk):
                 self.log_text.tag_configure(tag, foreground=self.t[key])
         if hasattr(self, 'var_theme_btn'):
             self.var_theme_btn.set('深色模式' if name == 'light' else '浅色模式')
+        if hasattr(self, 'row_menu'):
+            try:
+                self.row_menu.configure(bg=self.t['card'], fg=self.t['text'],
+                                        activebackground=self.t['accent'],
+                                        activeforeground=self.t['accent_fg'])
+            except tk.TclError:
+                pass
         if hasattr(self, 'var_theme_now'):
             self.var_theme_now.set('当前：%s' % ('浅色' if name == 'light' else '深色'))
         if save:
@@ -871,10 +977,11 @@ class App(tk.Tk):
                      kind='primary').pack(side='left')
         self._button(left, '添加账号', self.add_account).pack(side='left', padx=(8, 0))
         self._button(left, '编辑', self.edit_account).pack(side='left', padx=(8, 0))
-        self._button(left, '删除', self.delete_account, kind='danger').pack(
-            side='left', padx=(8, 0))
+        self._button(left, '重命名', self.rename_account).pack(side='left', padx=(8, 0))
         self._button(left, '启用/停用', self.toggle_account).pack(side='left', padx=(8, 0))
         self._button(left, '刷新', self.refresh_list).pack(side='left', padx=(8, 0))
+        self._button(left, '删除', self.delete_account, kind='danger').pack(
+            side='left', padx=(8, 0))
 
         right = self._frame(bar, 'card')
         right.pack(side='right', padx=16, pady=10)
@@ -920,6 +1027,8 @@ class App(tk.Tk):
         self.tree.pack(side='left', fill='both', expand=True)
         vsb.pack(side='right', fill='y')
         self.tree.bind('<Double-1>', lambda e: self.edit_account())
+        self.tree.bind('<Button-3>', self._show_row_menu)
+        self._build_row_menu()
         self._style_tree_tags()
 
         self.empty_hint = self._label(
@@ -1500,6 +1609,71 @@ class App(tk.Tk):
         else:
             self.var_live_account.set('客户端当前：未登录')
 
+    def _build_row_menu(self):
+        t = self.t
+        self.row_menu = tk.Menu(self, tearoff=0, bg=t['card'], fg=t['text'],
+                                activebackground=t['accent'], activeforeground=t['accent_fg'],
+                                bd=0, relief='flat', activeborderwidth=0)
+        for label, action in (('重命名备注', self.rename_account),
+                              ('编辑凭据…', self.edit_account),
+                              ('切换到此账号', self.switch_to_selected),
+                              ('启用 / 停用', self.toggle_account),
+                              ('复制 UID', self.copy_uid),
+                              ('刷新列表', self.refresh_list),
+                              (None, None),
+                              ('删除账号', self.delete_account)):
+            if label is None:
+                self.row_menu.add_separator()
+            else:
+                self.row_menu.add_command(label=label, command=action)
+
+    def _show_row_menu(self, event):
+        iid = self.tree.identify_row(event.y)
+        if not iid:
+            return 'break'
+        self.tree.selection_set(iid)
+        self.tree.focus(iid)
+        try:
+            self.row_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self.row_menu.grab_release()
+        return 'break'
+
+    def _selected_account(self, action='操作'):
+        sel = self.tree.selection()
+        if not sel:
+            messagebox.showinfo(action, '请先在列表里选中一个账号。', parent=self)
+            return None, None
+        idx = int(sel[0])
+        return idx, self.cfg['accounts'][idx]
+
+    def rename_account(self):
+        idx, acc = self._selected_account('重命名')
+        if acc is None:
+            return
+        old = str(acc.get('name') or acc.get('uid') or '账号%d' % (idx + 1))
+        new = simpledialog.askstring('重命名备注', '新的备注名（只影响面板显示）：',
+                                     initialvalue=old, parent=self)
+        if new is None:
+            return
+        new = new.strip()
+        if not new or new == old:
+            return
+        acc['name'] = new
+        self._after_accounts_changed('已重命名为：%s' % new)
+
+    def copy_uid(self):
+        idx, acc = self._selected_account('复制 UID')
+        if acc is None:
+            return
+        uid = str(acc.get('uid') or '').strip()
+        if not uid:
+            messagebox.showinfo('复制 UID', '该账号没有 UID，请先同步一次登录态。', parent=self)
+            return
+        self.clipboard_clear()
+        self.clipboard_append(uid)
+        self.var_footer.set('已复制 UID：%s' % uid)
+
     def add_account(self):
         choice = AddAccountDialog(self).result
         if choice == 'manual':
@@ -1520,40 +1694,72 @@ class App(tk.Tk):
             messagebox.showinfo('正在进行', '上一次浏览器登录还没结束，请稍候…', parent=self)
             return
         name = simpledialog.askstring(
-            '从浏览器获取', '给这个账号起个备注名（只影响面板显示）：',
-            initialvalue=self._next_default_name(), parent=self)
-        if not name or not name.strip():
+            '从浏览器获取', '给这个账号起个备注名（留空则自动用登录账号的昵称）：',
+            initialvalue='', parent=self)
+        if name is None:                       # 点了取消
             return
         name = name.strip()
         self.web_running = True
         self.web_stop.clear()
+        self._web_url = ''
+        self.web_dialog = WebAuthDialog(self, on_cancel=self.cancel_web_login,
+                                        on_reopen=self.reopen_auth_url)
         self.var_chip_status.set('等待浏览器授权…')
         self.log_ui('', 'dim')
-        self.log_ui('▶ 打开浏览器登录「%s」，用手机号 + 验证码完成授权' % name, 'head')
+        self.log_ui('▶ 打开浏览器登录%s，用手机号 + 验证码完成授权'
+                    % ('「%s」' % name if name else ''), 'head')
         threading.Thread(target=self._web_login_worker, args=(name, 300),
                          daemon=True).start()
+
+    def reopen_auth_url(self):
+        if not self._web_url:
+            return
+        import webbrowser
+        webbrowser.open(self._web_url)
+
+    def cancel_web_login(self):
+        if not self.web_running:
+            if self.web_dialog:
+                self.web_dialog.close()
+                self.web_dialog = None
+            return
+        self.web_stop.set()
+        if self.web_dialog:
+            self.web_dialog.set_status('正在取消授权…', 'warn')
+        self.log_ui('已取消本次授权', 'warn')
 
     def _web_login_worker(self, name, timeout):
         def log(text, level='dim'):
             self.msgq.put(('log', text))
+
+        def on_url(url):
+            self.msgq.put(('web_url', url))
+
         try:
-            res = WEB.web_login(name=name, timeout=timeout, log=log, stop=self.web_stop)
+            res = WEB.web_login(name=name, timeout=timeout, log=log,
+                                stop=self.web_stop, on_url=on_url)
         except Exception as exc:                            # noqa: BLE001
             res = {'ok': False, 'error': '登录异常：%s' % exc, 'account': None}
         self.msgq.put(('web_login_done', {'name': name, 'result': res}))
 
     def _on_web_login_done(self, payload):
         self.web_running = False
-        self._update_chips()
+        if self.web_dialog:
+            self.web_dialog.close()
+            self.web_dialog = None
         res = payload.get('result') or {}
         name = str(payload.get('name') or '')
         if res.get('ok') and res.get('account'):
-            self._merge_account(res['account'])
-            self.var_footer.set('已添加账号 · %s' % name)
-            messagebox.showinfo('添加成功', '已添加「%s」，可以直接签到了。'
-                                % (res['account'].get('name') or name), parent=self)
+            acc = res['account']
+            self._merge_account(acc)
+            shown = acc.get('name') or acc.get('username') or name or acc.get('uid')
+            self.var_footer.set('已添加账号 · %s' % shown)
+            self.log_ui('✅ 授权完成，已添加账号：%s' % shown, 'ok')
             return
         err = res.get('error') or '未知原因'
+        if err == '已取消':
+            self.var_footer.set('已取消浏览器登录')
+            return
         self.log_ui('❌ 浏览器登录失败：%s' % err, 'err')
         self.var_footer.set('浏览器登录失败')
         messagebox.showwarning('登录失败', err, parent=self)
@@ -1563,6 +1769,9 @@ class App(tk.Tk):
         acc = dict(account or {})
         if not acc.get('refreshToken'):
             return False
+        if not str(acc.get('name') or '').strip():
+            acc['name'] = (str(acc.get('username') or '').strip()
+                           or str(acc.get('uid') or '').strip() or '未命名账号')
         accounts = self.cfg.setdefault('accounts', [])
         uid = str(acc.get('uid') or '')
         token_key = str(acc.get('refreshToken') or '')[:24]
@@ -1929,7 +2138,7 @@ class App(tk.Tk):
             return False
         if self.web_running or self.switching:
             if interactive:
-                messagebox.showinfo('请稍候', '批量登录 / 切换账号还没结束，完成后再签到。',
+                messagebox.showinfo('请稍候', '浏览器授权 / 切换账号还没结束，完成后再签到。',
                                     parent=self)
             return False
         if not os.path.isfile(CHECKIN_SCRIPT):
@@ -2301,6 +2510,8 @@ class App(tk.Tk):
                     self._on_extract_keys(payload)
                 elif kind == 'web_login_done':
                     self._on_web_login_done(payload)
+                elif kind == 'web_url':
+                    self._web_url = str(payload or '')
                 elif kind == 'switch_done':
                     self._on_switch_done(payload)
                 elif kind == 'credits':
@@ -2348,10 +2559,13 @@ class App(tk.Tk):
                                 '确定退出吗？', parent=self):
             return
         if self.web_running:
-            if not messagebox.askyesno('正在批量登录', '批量登录还没结束，确定退出吗？',
+            if not messagebox.askyesno('正在授权', '浏览器授权还没结束，确定退出吗？',
                                        parent=self):
                 return
             self.web_stop.set()
+        if self.web_dialog:
+            self.web_dialog.close()
+            self.web_dialog = None
         self.save_config(silent=True)
         self.destroy()
 
