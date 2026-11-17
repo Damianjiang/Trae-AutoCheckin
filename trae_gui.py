@@ -1340,6 +1340,12 @@ class App(tk.Tk):
 
     def build_trae_config(self):
         """生成交给 trae_checkin.py 的 TRAE_CONFIG（只含非空字段）。"""
+        import contextlib
+        import io
+        try:
+            import trae_checkin as checkin
+        except Exception:                                    # noqa: BLE001
+            checkin = None
         payload = {}
         accounts = []
         for acc in self.cfg.get('accounts', []):
@@ -1347,10 +1353,20 @@ class App(tk.Tk):
                 continue
             item = {}
             for key in ('refreshToken', 'accessToken', 'uid', 'name', 'deviceId',
-                        'realDeviceId', 'deviceKeyPem', 'devicePubPem', 'machineId'):
+                        'realDeviceId', 'checkinDeviceId', 'deviceKeyPem', 'devicePubPem',
+                        'machineId'):
                 value = str(acc.get(key) or '').strip()
                 if value:
                     item[key] = value
+            # 签到设备号现算一遍：必须是客户端真实注册号，配置里留着旧值会让签到被判 9074。
+            if checkin is not None:
+                try:
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        owned = checkin.account_real_device_ids(acc)
+                    if owned:
+                        item['checkinDeviceId'] = owned[0]
+                except Exception:                            # noqa: BLE001
+                    pass
             if item.get('refreshToken') or item.get('accessToken'):
                 accounts.append(item)
         if accounts:
@@ -1423,7 +1439,8 @@ class App(tk.Tk):
                 bind += '（缺密钥）'
             self.tree.insert('', 'end', iid=str(idx), tags=(row_tag, tag), values=(
                 state_text, name, str(acc.get('uid') or '-'), shown or '-',
-                str(acc.get('realDeviceId') or acc.get('deviceId') or '-'), bind, credits))
+                str(acc.get('checkinDeviceId') or acc.get('realDeviceId')
+                    or acc.get('deviceId') or '-'), bind, credits))
         total = len(self.cfg.get('accounts', []))
         enabled = len(self.enabled_accounts())
         self.var_account_count.set('共 %d 个账号（启用 %d 个）' % (total, enabled))
@@ -1575,10 +1592,27 @@ class App(tk.Tk):
 
     def _auto_bind_accounts(self):
         """启动时给缺绑定/缺设备密钥的账号补全（只补空缺，不覆盖已有值）。"""
-        if SWITCH is None:
-            return
         changed = 0
+        try:
+            import contextlib
+            import io
+            import trae_checkin as checkin
+        except Exception:                                   # noqa: BLE001
+            checkin = None
         for acc in self.cfg.get('accounts', []):
+            # 签到设备号：必须是客户端真实注册号。网页登录自造的号能续期但会被判 9074，
+            # 所以这里把「本机登录着该号的客户端注册号」单独记进 checkinDeviceId。
+            if checkin is not None:
+                try:
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        owned = checkin.account_real_device_ids(acc)
+                    if owned and owned[0] != str(acc.get('checkinDeviceId') or ''):
+                        acc['checkinDeviceId'] = owned[0]
+                        changed += 1
+                except Exception:                        # noqa: BLE001
+                    pass
+            if SWITCH is None:
+                continue
             if acc.get('deviceKeyPem') and acc.get('devicePubPem') and acc.get('client'):
                 continue
             info = SWITCH.auto_bind(acc)
@@ -1587,7 +1621,9 @@ class App(tk.Tk):
             for key in ('client', 'deviceKeyPem', 'devicePubPem', 'machineId', 'realDeviceId'):
                 if info.get(key) and not acc.get(key):
                     acc[key] = info[key]
-            if info.get('realDeviceId'):
+            if info.get('realDeviceId') and not (acc.get('deviceKeyPem') and acc.get('devicePubPem')):
+                # 只有账号自己没有设备密钥（即没绑定任何签发身份）时，才把续期身份指向客户端；
+                # 网页登录自造过身份的账号必须保留它自己的密钥，否则续期会 10101。
                 acc['deviceId'] = info['realDeviceId']
             changed += 1
         if changed:
@@ -1945,8 +1981,15 @@ class App(tk.Tk):
                 old_did = str(target.get('realDeviceId') or target.get('deviceId') or '').strip()
                 changed = False
                 if did and did != old_did:
-                    target['realDeviceId'] = did
-                    changed = True
+                    if target.get('deviceKeyPem') and target.get('devicePubPem'):
+                        # 账号已绑定自己的签发身份（如网页登录自造密钥），token 就是那套签的：
+                        # 改 realDeviceId 会让续期 10101，所以客户端真号只记成「签到设备号」。
+                        if str(target.get('checkinDeviceId') or '') != did:
+                            target['checkinDeviceId'] = did
+                            changed = True
+                    else:
+                        target['realDeviceId'] = did
+                        changed = True
                 new_at = str(acc.get('accessToken') or '').strip()
                 old_at = str(target.get('accessToken') or '').strip()
                 if new_at and new_at != old_at and (

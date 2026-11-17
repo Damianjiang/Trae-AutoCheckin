@@ -52,7 +52,7 @@ class TraeAlreadyCheckedInTests(unittest.TestCase):
 
     def test_checkin_account_reports_9004_as_signed(self):
         account = {"accessToken": "token", "deviceId": "device", "name": "tester"}
-        with patch.object(CHECKIN, "device_id_for", return_value="device"), \
+        with patch.object(CHECKIN, "checkin_device_id", return_value="device"), \
                 patch.object(CHECKIN, "status_of", return_value=(False, 0, True, 0, "{}")), \
                 patch.object(CHECKIN, "claim_with_retry", return_value=(False, 9004, "already", None)), \
                 patch.object(CHECKIN, "credits_summary", return_value=250):
@@ -64,7 +64,7 @@ class TraeAlreadyCheckedInTests(unittest.TestCase):
 
     def test_checkin_account_reports_9095_as_signed(self):
         account = {"accessToken": "token", "deviceId": "device", "name": "tester"}
-        with patch.object(CHECKIN, "device_id_for", return_value="device"), \
+        with patch.object(CHECKIN, "checkin_device_id", return_value="device"), \
                 patch.object(CHECKIN, "status_of", return_value=(False, 0, True, 0, "{}")), \
                 patch.object(CHECKIN, "claim_with_retry", return_value=(False, 9095, "already", None)), \
                 patch.object(CHECKIN, "credits_summary", return_value=250):
@@ -73,6 +73,72 @@ class TraeAlreadyCheckedInTests(unittest.TestCase):
         self.assertEqual("已签到", result["status"])
         self.assertEqual("☑️", result["icon"])
         self.assertIn("9095", result["detail"])
+
+
+class TraeCheckinDeviceIdTests(unittest.TestCase):
+    """签到设备号必须走客户端真实注册号，且绝不能动续期身份。
+
+    回归背景（2026-11-17）：网页登录自造的设备号能续期，但签到时被服务端判 9074。
+    """
+
+    def test_prefers_client_registered_id_over_selfmade_explicit(self):
+        acc = {"uid": "1000000000000001", "deviceId": "1234567890123456",
+               "realDeviceId": "1234567890123456", "checkinDeviceId": "1234567890123456"}
+        with patch.object(CHECKIN, "account_real_device_ids",
+                          return_value=["aha-0123456789abcdef0123456789abcdef"]), \
+                patch.object(CHECKIN, "load_checkin_devices", return_value={}), \
+                patch.object(CHECKIN, "save_checkin_devices"):
+            with redirect_stdout(io.StringIO()):
+                did = CHECKIN.checkin_device_id(acc)
+        self.assertEqual("aha-0123456789abcdef0123456789abcdef", did)
+
+    def test_remembers_last_good_device_when_client_not_logged_in(self):
+        acc = {"uid": "1000000000000001", "deviceId": "1234567890123456"}
+        with patch.object(CHECKIN, "account_real_device_ids", return_value=[]), \
+                patch.object(CHECKIN, "load_checkin_devices",
+                             return_value={CHECKIN._acct_key(acc): "aha-0123456789abcdef0123456789abcdef"}):
+            did = CHECKIN.checkin_device_id(acc)
+        self.assertEqual("aha-0123456789abcdef0123456789abcdef", did)
+
+    def test_rotate_swaps_checkin_id_only(self):
+        acc = {"uid": "1000000000000001", "deviceId": "1234567890123456",
+               "realDeviceId": "1234567890123456", "checkinDeviceId": "aha-real-1"}
+        with patch.object(CHECKIN, "account_real_device_ids",
+                          return_value=["aha-real-1", "aha-real-2"]):
+            with redirect_stdout(io.StringIO()):
+                did = CHECKIN.rotate_device_id(acc)
+        self.assertEqual("aha-real-2", did)
+        self.assertEqual("aha-real-2", acc["checkinDeviceId"])
+        # 续期身份一个字都不能变，否则下次续期 20403/10101
+        self.assertEqual("1234567890123456", acc["deviceId"])
+        self.assertEqual("1234567890123456", acc["realDeviceId"])
+
+    def test_checkin_account_does_not_overwrite_renewal_identity(self):
+        acc = {"accessToken": "token", "deviceId": "1234567890123456", "name": "tester",
+               "uid": "1000000000000001", "_realDid": "1234567890123456"}
+        with patch.object(CHECKIN, "checkin_device_id", return_value="aha-real"), \
+                patch.object(CHECKIN, "status_of", return_value=(True, 100, True, 0, "{}")), \
+                patch.object(CHECKIN, "credits_summary", return_value=100):
+            with redirect_stdout(io.StringIO()):
+                result = CHECKIN.checkin_account(acc, {})
+        self.assertEqual("已签到", result["status"])
+        self.assertEqual("aha-real", acc["checkinDeviceId"])
+        self.assertEqual("1234567890123456", acc["deviceId"])
+        self.assertEqual("1234567890123456", acc["_realDid"])
+
+    def test_claim_request_carries_checkin_device_id(self):
+        acc = {"accessToken": "token", "deviceId": "1234567890123456",
+               "checkinDeviceId": "aha-0123456789abcdef0123456789abcdef"}
+        seen = {}
+
+        def fake_claim(token, device_id):
+            seen['did'] = device_id
+            return 200, 0, "success", 100
+
+        with patch.object(CHECKIN, "claim", side_effect=fake_claim):
+            ok, code, _msg, _points = CHECKIN.claim_with_retry(acc, {})
+        self.assertTrue(ok)
+        self.assertEqual("aha-0123456789abcdef0123456789abcdef", seen['did'])
 
 
 class TraeRewardCreditsTests(unittest.TestCase):

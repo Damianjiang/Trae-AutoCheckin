@@ -6,6 +6,8 @@ trae_token_cache.json
 trae_checkin_state.json
 .trae_device_ids.json
 trae_device_ids.json
+.trae_checkin_devices.json
+trae_checkin_devices.json
 .trae_token.json
 trae_token.json
 trae_sms_accounts.json
@@ -43,6 +45,8 @@ logs/
 # ---- 杂项 ----
 *.log
 *.bak
+*.bak-*
+*.bak_*
 .DS_Store
 
 # ---- 防止 trae_get_token.py 副本入库（relay 自动查找同目录/上一级目录）----

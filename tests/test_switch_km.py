@@ -157,8 +157,11 @@ class WebDeviceTests(unittest.TestCase):
         ids = {WEB.gen_device()["device_id"] for _ in range(8)}
         self.assertEqual(len(ids), 8)
         for item in ids:
-            self.assertEqual(len(item), 16)
-            self.assertTrue(item.isdigit())
+            # 新版客户端设备号格式：aha- + 32 位小写十六进制
+            self.assertTrue(item.startswith("aha-"), item)
+            self.assertEqual(len(item), 36)
+            self.assertTrue(all(c in "0123456789abcdef" for c in item[4:]))
+            self.assertTrue(WEB.CK.is_valid_device_id(item))
 
     def test_authorize_url_carries_identity(self):
         dev = WEB.gen_device()

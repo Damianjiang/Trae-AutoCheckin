@@ -248,6 +248,8 @@ QYWX_TOKEN = os.getenv('QYWX_TOKEN') or os.getenv('WECHAT_WEBHOOK') or ''
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEVICE_ID_FILE = os.path.join(HERE, '.trae_device_ids.json')
+# 签到专用设备号（客户端真实注册号）：与续期身份分开记，客户端登录态变了也不丢。
+CHECKIN_DEVICE_FILE = os.path.join(HERE, '.trae_checkin_devices.json')
 STATE_FILE = os.path.join(HERE, '.trae_checkin_state.json')
 # 刷新后的 token 缓存：Trae 每次续期都会轮换 refreshToken，青龙里
 # TRAE_ACCOUNTS 是静态的，必须靠本文件记住最新的 token 对，否则会越刷越失效。
@@ -773,6 +775,7 @@ def local_device_identities():
             uid = str((creds or {}).get('userId') or '').strip()
         except Exception:
             uid = ''
+        primary = dc_device_id(storage)
         for key, value in storage.items():
             if not key.startswith('iCubeAuthInfo://icube-dc:'):
                 continue
@@ -789,7 +792,8 @@ def local_device_identities():
                 continue
             found.append({'deviceId': did, 'privateKeyPem': priv,
                           'publicKeyPem': pub, 'machineId': machine_id,
-                          'uid': uid, 'product': product, 'from': sp})
+                          'uid': uid, 'product': product, 'from': sp,
+                          'primary': bool(primary) and did == primary})
     return found
 
 def norm_pem(v):
@@ -1061,6 +1065,36 @@ def stable_device_id(seed):
     return str(int.from_bytes(h[:8], 'big') % (10 ** 16 - 10 ** 15) + 10 ** 15)
 
 
+def stable_aha_device_id(seed):
+    """由账号特征生成 `aha-<32 位十六进制>` 设备号 —— 与新版客户端同格式。
+
+    旧版客户端用 16 位数字，2.x 之后（storage 里 `has_device_id_updated_to_aha=true`）
+    统一成 aha- 前缀。签到服务端对两种格式的历史号都认，但新造的号只有这个格式
+    才和客户端写出来的一模一样，不会一眼看出是拼凑的。
+    """
+    digest = hashlib.sha256(('aha:' + str(seed)).encode('utf-8')).hexdigest()
+    return 'aha-' + digest[:32]
+
+
+def machine_fingerprint():
+    """本机客户端记录的 `telemetry.machineId`（真实机器指纹），读不到返回空串。
+
+    自造设备身份时用它，能和一整台真实机器的指纹对得上；
+    不填的话就是纯随机的 32 位 hex，和真实客户端的取值风格不同。
+    """
+    for sp in storage_paths():
+        try:
+            with open(sp, 'r', encoding='utf-8') as fh:
+                storage = json.load(fh)
+        except Exception:
+            continue
+        if isinstance(storage, dict):
+            mid = str(storage.get('telemetry.machineId') or '').strip()
+            if mid:
+                return mid
+    return ''
+
+
 def load_device_ids():
     try:
         with open(DEVICE_ID_FILE, 'r', encoding='utf-8') as fh:
@@ -1077,6 +1111,25 @@ def save_device_ids(ids):
         print('⚠️  [设备号] 持久化失败: %s' % e)
 
 
+def load_checkin_devices():
+    try:
+        with open(CHECKIN_DEVICE_FILE, 'r', encoding='utf-8') as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_checkin_devices(data):
+    try:
+        tmp = CHECKIN_DEVICE_FILE + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as fh:
+            json.dump(data, fh, ensure_ascii=False, indent=2)
+        os.replace(tmp, CHECKIN_DEVICE_FILE)
+    except Exception as e:
+        print('⚠️  [设备号] 签到号持久化失败: %s' % e)
+
+
 def real_device_ids():
     """扫描本机所有 Trae 客户端 storage.json，返回真实注册过的设备号（去重）。"""
     out = []
@@ -1087,41 +1140,107 @@ def real_device_ids():
     return out
 
 
-def rotate_device_id(acc):
-    """9074 后尝试换设备号 —— 但只能换成**客户端真实注册过的另一个号**。
+def account_real_device_ids(acc):
+    """本机客户端里**确实属于这个账号**的注册设备号，按可信度排序。
 
-    实测：服务端认的是客户端注册过的那串数字，生成的号注定被拒成 9074。
-    所以这里绝不再生成假号，只在本机能读到另一个真实号时切换；
-    读不到就返回 None，由调用方冷却等待（继续烧假号只会越戳越黑）。
+    只认两件事：storage 当前登录 uid == 账号 uid，且该设备号是这台客户端的
+    **当前注册号**（dc_device_id，即 iCubeAuthInfo://icube-dc:<号> 里最新的那个）。
+    同一份 storage 里还会残留别的账号曾登录时留下的 icube-dc 键 —— 那些是历史号，
+    算进来会把签到请求发到别人的设备号上（照样 9074，还可能签错）。
+    账号 uid 为空时返回 []（宁可用账号自带号，也不乱拿别人的号）。
+    """
+    uid = str(acc.get('uid') or '').strip()
+    if not uid:
+        return []
+    out = []
+    for item in local_device_identities():
+        if str(item.get('uid') or '') != uid or not item.get('primary'):
+            continue
+        did = str(item.get('deviceId') or '').strip()
+        if is_valid_device_id(did) and did not in out:
+            out.append(did)
+    return out
+
+
+def rotate_device_id(acc):
+    """9074 后换一个**同账号在本机客户端注册过的其它真实设备号**再试。
+
+    只动签到用的设备号（checkinDeviceId），绝不碰续期身份（_realDid/deviceId + 密钥）：
+    后者是 token 签发时绑定的，改了就续期 20403/10101（实测）。
+    本机找不到第二个真实号时返回 None，交给冷却等下一轮（继续烧假号只会更黑）。
     """
     key = _acct_key(acc)
     name = acc.get('_name') or acc.get('name') or key
-    real = str(acc.get('_realDid') or '').strip()
-    if real:
-        # token 是绑定这台设备签发的，换别人的设备号既续不了期，
-        # 还可能撞上「该设备今日已签」把你误记成签到成功，所以不再切换。
-        print('ℹ️  [设备号] %s 已绑定客户端真实设备号 %s，不再切换' % (name, real))
-        return None
-    tried = {str(acc.get('deviceId') or '').strip(), real}
-    for d in real_device_ids():
-        if d not in tried:
-            acc['deviceId'] = d
-            acc['_realDid'] = d
-            print('🔄 [设备号] %s 换用本机客户端的另一个真实设备号 %s' % (name, d))
+    cur = str(acc.get('checkinDeviceId') or acc.get('deviceId') or '').strip()
+    for d in account_real_device_ids(acc):
+        if d != cur:
+            acc['checkinDeviceId'] = d
+            print('🔄 [设备号] %s 换用本机为它注册的另一个真实设备号 %s' % (name, d))
             return d
     print('ℹ️  [设备号] %s 没有可切换的其它真实设备号（生成号注定 9074，不再更换）' % name)
     return None
 
+
+def checkin_device_id(acc, manual='', want_source=False):
+    """签到请求里 x-device-id 的取值 —— **必须是客户端真实注册过的号**。
+
+    与续期身份刻意分开：网页登录自造的号能续期（token 正是它签发的），
+    但签到接口只认客户端注册号，自造号一律被判 9074（已实测对照）。
+    取值顺序：
+      1) 配置里的 checkinDeviceId（且确实是本机给这个账号注册的号）；
+      2) 本机登录着这个 uid 的客户端当前设备号（**自动纠正，无需人工配置**）；
+      3) 上次确认过的签到号（.trae_checkin_devices.json，客户端登录态变了也不丢）；
+      4) realDeviceId / deviceId（别的机器上的真号也能过，作为兜底）；
+      5) 持久化 / 生成号 —— 注定 9074，只用于让流程跑完并输出可读日志。
+
+    want_source=True 时返回 (设备号, 来源标签)，供 --check-devices 自检用。
+    """
+    key = _acct_key(acc)
+    explicit = str(acc.get('checkinDeviceId') or '').strip()
+    owned = account_real_device_ids(acc)
+
+    def done(value, source):
+        return (value, source) if want_source else value
+
+    if is_valid_device_id(explicit) and (not owned or explicit in owned):
+        return done(explicit, '配置')
+    if owned:
+        if is_valid_device_id(explicit) and explicit not in owned:
+            print('⚠️  [设备号] %s 配的签到号 %s 不是本机给它的注册号，自动改用 %s'
+                  % (acc.get('_name') or acc.get('uid') or '?', explicit, owned[0]))
+        remember = load_checkin_devices()
+        if remember.get(key) != owned[0]:
+            remember[key] = owned[0]
+            save_checkin_devices(remember)
+        return done(owned[0], '客户端注册')
+    remembered = str(load_checkin_devices().get(key) or '').strip()
+    if is_valid_device_id(remembered):
+        return done(remembered, '上次可用')
+    real = str(acc.get('_realDid') or '').strip()
+    if is_valid_device_id(real):
+        return done(real, '账号自带')
+    if is_valid_device_id(manual):
+        return done(str(manual).strip(), '账号自带')
+    seed = key
+    ids = load_device_ids()
+    if seed in ids:
+        return done(ids[seed], '自造号（大概率 9074）')
+    new_id = stable_aha_device_id(seed)
+    ids[seed] = new_id
+    save_device_ids(ids)
+    return done(new_id, '自造号（大概率 9074）')
+
+
+def ug_device_id(acc):
+    """签到/积分这些 UG 接口统一用的 x-device-id。"""
+    return str(acc.get('checkinDeviceId') or acc.get('deviceId') or '').strip()
+
+
 def device_id_for(acc, manual=''):
-    """优先级：客户端真实设备号 > 手动 deviceId > 已持久化 > 生成兜底。
+    """续期/身份用途的设备号：客户端真实设备号(_realDid) > 手动 > 持久化 > 生成。
 
-    实测（同账号同时刻对照）：x-device-id 用客户端注册过的真实号才能过设备检查，
-    生成的号一律被拒成 9074。所以本机读得到真实号时，它优先于配置里的任何值；
-    配置值只在本机读不到真实号时使用（它可能是从别的机器拷来的真号）。
-    生成的号只作最后兜底，让脚本能跑完并给出可读的失败信息，不代表能签成。
-
-    种子必须用稳定键(_acct_key)：早先用 accessToken 做种子，而 accessToken
-    每次续期都会变，导致设备号每轮都换 —— "设备不停更换"本身就是高危信号。"""
+    注意：签到不要用它，用 checkin_device_id()。两者在「网页登录自造身份」的账号上
+    会是两个不同的号 —— 用错了就是本次 9074 的根因。"""
     real = str(acc.get('_realDid') or '').strip()
     if is_valid_device_id(real):
         return real
@@ -1131,7 +1250,7 @@ def device_id_for(acc, manual=''):
     ids = load_device_ids()
     if seed in ids:
         return ids[seed]
-    new_id = stable_device_id(seed)
+    new_id = stable_aha_device_id(seed)
     ids[seed] = new_id
     save_device_ids(ids)
     return new_id
@@ -1186,6 +1305,11 @@ def normalize(d, src, name='', real=''):
 
     设备相关字段（deviceId / deviceKeyPem / devicePubPem / machineId）会原样带出来 ——
     不同账号可能绑在不同机器上，续期时必须用**签发它的那台机器的设备密钥**。
+
+    注意 deviceId 与 checkinDeviceId 是两回事：
+      • deviceId（以及 realDeviceId）是**签发 token 的那套设备身份**，续期必须用它；
+      • checkinDeviceId 是签到时塞进 x-device-id 的**客户端真实注册号**，
+        网页登录自造的号能续期但会被签到接口拒成 9074，所以单独记一份。
     """
     return {'accessToken': pick(d, 'accessToken', 'token', 'access_token'),
             'refreshToken': pick(d, 'refreshToken', 'refresh_token'),
@@ -1193,6 +1317,7 @@ def normalize(d, src, name='', real=''):
             'deviceKeyPem': pick(d, 'deviceKeyPem', 'device_key_pem'),
             'devicePubPem': pick(d, 'devicePubPem', 'device_pub_pem'),
             'machineId': pick(d, 'machineId', 'machine_id'),
+            'checkinDeviceId': pick(d, 'checkinDeviceId', 'checkin_device_id'),
             'uid': str(pick(d, 'uid', 'userId', 'user_id')),
             '_src': src, '_name': name, '_realDid': real}
 
@@ -1380,7 +1505,7 @@ def claim_with_retry(acc, cache):
         tries = 1
     last = ('?', '')
     for attempt in range(1, tries + 1):
-        status, code, msg, points = claim(acc['accessToken'], acc.get('deviceId'))
+        status, code, msg, points = claim(acc['accessToken'], ug_device_id(acc))
         last = (code, msg)
         if code == 0:
             return True, code, msg, points
@@ -1391,6 +1516,7 @@ def claim_with_retry(acc, cache):
             ok, rmsg = ensure_token(acc, cache)
             if not ok:
                 return False, code, rmsg, None
+            acc['checkinDeviceId'] = checkin_device_id(acc, acc.get('deviceId', ''))
             continue
         if not is_rate(code, status):
             return False, code, msg
@@ -1434,7 +1560,7 @@ def parse_credits(payload):
 
 def credits_summary(acc):
     """查询当前积分余额；查不到返回 None。"""
-    status, text = _post(EP_ENTITLE, ug_headers(acc['accessToken'], acc.get('deviceId')),
+    status, text = _post(EP_ENTITLE, ug_headers(acc['accessToken'], ug_device_id(acc)),
                          '{"require_usage": true}', 15)
     try:
         return parse_credits(json.loads(text))
@@ -1445,7 +1571,7 @@ def credits_summary(acc):
 def fetch_credits(acc, cache=None):
     """实时查积分，token 过期时续期一次再查；全程失败返回 None。"""
     def query():
-        status, text = _post(EP_ENTITLE, ug_headers(acc['accessToken'], acc.get('deviceId')),
+        status, text = _post(EP_ENTITLE, ug_headers(acc['accessToken'], ug_device_id(acc)),
                              '{"require_usage": true}', 15)
         try:
             return parse_credits(json.loads(text)), status
@@ -1526,17 +1652,22 @@ def checkin_account(acc, cache):
             result['detail'] = msg
             return result
 
-    acc['deviceId'] = device_id_for(acc, acc.get('deviceId', ''))
-    print('📱 [设备号] %s: %s' % (name, acc['deviceId']))
+    acc['checkinDeviceId'] = checkin_device_id(acc, acc.get('deviceId', ''))
+    print('📱 [设备号] %s: %s' % (name, acc['checkinDeviceId']))
+    renew = str(acc.get('_realDid') or acc.get('deviceId') or '').strip()
+    if renew and renew != acc['checkinDeviceId']:
+        # 自造身份（网页登录）能续期但签不了到，这里分开显示便于排查
+        print('    ↳ 续期身份仍用 %s（token 由它签发，不能换）' % renew)
     log_head('📡 %s 签到状态查询' % name)
 
-    checked_in, credits, enable, code, raw = status_of(acc['accessToken'], acc['deviceId'])
+    checked_in, credits, enable, code, raw = status_of(acc['accessToken'], acc['checkinDeviceId'])
     if code in AUTH_FAIL_CODES and acc.get('refreshToken'):
         print('🔑 [刷新] 检测到 code=%s 鉴权失败，尝试刷新 token ...' % code)
         ok, msg = ensure_token(acc, cache)
         if ok:
             print('✅ [刷新] token 已更新')
-            checked_in, credits, enable, code, raw = status_of(acc['accessToken'], acc['deviceId'])
+            acc['checkinDeviceId'] = checkin_device_id(acc, acc.get('deviceId', ''))
+            checked_in, credits, enable, code, raw = status_of(acc['accessToken'], acc['checkinDeviceId'])
         else:
             print('❌ [刷新] 失败: %s' % msg)
     print('📊 [状态] 今日已签: %s   积分: %s   开放: %s' % (checked_in, credits, enable))
@@ -1589,7 +1720,7 @@ def checkin_account(acc, cache):
         # 为准；没翻转就不报成功，交给下一轮 cron，避免亮绿灯但实际什么都没到账。
         confirmed = False
         if os.getenv('TRAE_VERIFY_CLAIM', '1').strip() != '0':
-            checked_after, _, _, code_after, _ = status_of(acc['accessToken'], acc['deviceId'])
+            checked_after, _, _, code_after, _ = status_of(acc['accessToken'], acc['checkinDeviceId'])
             confirmed = checked_after is True
             if not confirmed:
                 result['icon'] = '⏳'
@@ -1607,7 +1738,7 @@ def checkin_account(acc, cache):
             result['credits'] = pts
             result['detail'] = '签到成功%s，当前余额 %s' % (gain, _fmt(pts))
         else:
-            _, credits_after, _, _, _ = status_of(acc['accessToken'], acc['deviceId'])
+            _, credits_after, _, _, _ = status_of(acc['accessToken'], acc['checkinDeviceId'])
             result['credits'] = credits_after if credits_after is not None else credits
             result['detail'] = '签到成功（已回查确认），积分 %s → %s' % (credits, _fmt(result['credits']))
         print('🎉 [结果] 签到成功（已回查确认）')
@@ -1645,7 +1776,57 @@ PEAK_COOLDOWN_MIN = 12           # 早窗内的短冷却，好让下一轮还在
 GAP_MIN, GAP_MAX = 1, 1          # 账号之间固定错开 1 秒（TRAE_GAP_SEC 可改）
 
 
+def device_report():
+    """自检：每个账号用哪个设备号、今天是否已签、能不能签。只读，不发 claim。
+
+    用法：python trae_checkin.py --check-devices
+    面板里也有对应提示；发版前先跑一遍，能确认没有任何账号会掉进 9074。
+    """
+    accounts = load_accounts()
+    if not accounts:
+        print('⚠️ 没有可用账号（检查 TRAE_CONFIG / TRAE_ACCOUNTS）')
+        return
+    print('本机客户端：')
+    print('  机器指纹 machineId = %s' % (machine_fingerprint() or '(读不到)'))
+    for sp in storage_paths():
+        print('  - %s' % sp)
+    bad = 0
+    for acc in accounts:
+        name = acc.get('_name') or acc.get('name') or acc.get('uid')
+        uid = str(acc.get('uid') or '')
+        did, src = checkin_device_id(acc, acc.get('deviceId', ''), want_source=True)
+        renew = str(acc.get('_realDid') or acc.get('deviceId') or '')
+        detail = ''
+        try:
+            if acc.get('accessToken'):
+                checked, credits, enable, code, _ = status_of(acc['accessToken'], did)
+                detail = '今日已签=%s  积分=%s  开放=%s' % (checked, credits, enable)
+                if code not in (0, -1):
+                    detail += '（查询码 %s，token 可能已过期，首轮会自动续期）' % code
+            else:
+                detail = '无 accessToken，首轮自动续期后再查'
+        except Exception as exc:                            # noqa: BLE001
+            detail = '查询异常：%s' % exc
+        ready = src in ('配置', '客户端注册', '上次可用', '账号自带')
+        if not ready:
+            bad += 1
+        print('─' * 58)
+        print('账号：%s（UID %s）' % (name, uid or '-'))
+        print('  续期身份：%s（token 由它签发，不能换）' % (renew or '未配置'))
+        print('  签到设备号：%s（来源：%s）' % (did, src))
+        print('  状态：%s' % detail)
+        print('  结论：%s' % ('✅ 可以签到' if ready else '⚠️ 本机没有这个号的客户端注册号，签到会 9074'))
+    print('─' * 58)
+    if bad:
+        print('⚠️ %d 个账号没有真实设备号：在该账号登录一次 Trae 客户端后重跑本命令' % bad)
+    else:
+        print('✅ 全部账号的签到设备号都可用')
+
+
 def main():
+    if '--check-devices' in sys.argv:
+        device_report()
+        return
     accounts = load_accounts()
     cache = load_cache()
     log_title(len(accounts))

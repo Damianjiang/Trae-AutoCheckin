@@ -1,5 +1,24 @@
 # 更新日志
 
+## v1.2.4（2026-11-17）
+
+- 修复：**网页登录新增的账号次日签到必被判 9074（参与用户太多）**。
+  - 根因：`trae_weblogin.py` 会自造一套设备身份（16 位号 + P-256 密钥对）去换 token。这套号能正常续期，但签到接口只认客户端注册过的真实号，自造号一律 9074；而旧代码把「续期身份」和「签到设备号」当成同一个字段（`realDeviceId`），发现它非空就不再纠正，于是天天 9074。
+  - 现在拆成两个字段：`deviceId`/`realDeviceId` = **续期身份**（token 由它签发，绝不能被改），`checkinDeviceId` = **签到设备号**（必须是客户端真实注册号）。
+  - 新增 `checkin_device_id()`：优先级为 配置值 > 本机登录该 uid 的客户端当前注册号 > `.trae_checkin_devices.json` 记住的上次可用号 > 账号自带号。本机客户端登录着该号时会自动纠正，无需人工填。
+  - 新增 `account_real_device_ids()`：只认「storage 当前登录 uid == 账号 uid」的客户端**当前注册号**，同 storage 里别的账号残留的历史设备号不再被误用。
+  - `rotate_device_id()` 改为只在签到维度换号：命中 9074 时在同账号的真实号之间切换，绝不改续期身份（改了续期会 20403/10101）。
+  - `checkin_account()` / `claim_with_retry()` / `credits_summary()` / `fetch_credits()` 统一改用签到设备号发请求。
+  - 面板：`checkinDeviceId` 加入子进程载荷白名单并在每次签到前现算；「读取本机账号」遇到已自带签发密钥的账号时，把客户端真号写进 `checkinDeviceId` 而不是覆盖 `realDeviceId`；账号列表设备号列显示实际用于签到的号。
+  - `trae_weblogin.py`：登录成功时自动带上本机客户端注册号；本机没有该号的客户端时明确提示「签到可能 9074，请在客户端登录一次」。
+  - 测试：新增 5 项回归（真实号优先、记忆兜底、换号不动续期身份、账号处理不改续期身份、claim 请求携带签到号），全套 85 项通过。
+  - 实测（2026-11-17）：`Damian2012` 用 `aha-0123456789abcdef0123456789abcdef` 领取返回 `code=0` 并到账；回查已签，积分 164.46。
+- 新增 `python trae_checkin.py --check-devices` 自检：逐账号打印「续期身份 / 签到设备号（来源）/ 今日状态 / 结论」，只读不发 claim，发版或换机后先跑一遍即可确认没有账号会掉进 9074。
+- 伪造层升级为与客户端同构（`main.js` 反向确认：设备号由客户端 `iCubeDeviceRegister` 向设备登记服务注册后拿到 `guaranteedDeviceId = aha-<32hex>`，**不是本地能算出来的**）：
+  - `trae_weblogin.gen_device()` 改为 `aha-` + 32 位十六进制，machineId 优先取本机真实 `telemetry.machineId`；
+  - 新增 `stable_aha_device_id()` / `machine_fingerprint()`，自造兜底号也统一成 `aha-` 格式；
+  - 实测排除：`aha-` 号无法由 machineId / devDeviceId / sqmId / hostname / `device_id_str` 哈希派生（0 命中）；网页登录的 `ExchangeToken` 只写 `DeviceInfo`，**不会**把设备登记进签到服务。故「纯自造号必 9074」是服务端设计，README 已写明唯一的可靠前提。
+
 ## v1.2.3（2026-11-15）
 
 - 新增界面截图（`screenshots/`），README 增加「界面预览」一节。

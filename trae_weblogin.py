@@ -123,11 +123,23 @@ def _write_devices(data):
 
 
 def gen_device():
-    """造一套全新设备身份：16 位数字设备号 + 32 位 hex machineId + P-256 密钥对。"""
+    """造一套设备身份：`aha-<32hex>` 设备号 + machineId + P-256 密钥对。
+
+    格式刻意对齐新版客户端（storage 里 `has_device_id_updated_to_aha=true` 之后的写法）：
+    设备号 `aha-` 前缀、machineId 优先取本机客户端记录的真实指纹，
+    这样这套身份和真实客户端写出来的一模一样，不会因为“号是拼凑的”被额外风控。
+    注意：格式一致 ≠ 服务端已登记 —— 签到服务端只认客户端登记过的设备，
+    自造号仍可能被判 9074，所以签到设备号优先用本机已登记的号（见 checkin_device_id）。
+    """
     private_pem, public_pem, scalar, _ = gen_keypair()
+    machine_id = ''
+    try:
+        machine_id = CK.machine_fingerprint()
+    except Exception:
+        machine_id = ''
     return {
-        'device_id': ''.join(secrets.choice('0123456789') for _ in range(16)),
-        'machine_id': secrets.token_hex(16),
+        'device_id': 'aha-' + secrets.token_hex(16),
+        'machine_id': machine_id or secrets.token_hex(16),
         'private_key': private_pem,
         'public_key': public_pem,
         'scalar': scalar,
@@ -339,6 +351,18 @@ def web_login(name='', device_key='', timeout=300, open_browser=True, log=None,
         'source': '网页登录（自造设备身份）',
         'enabled': True,
     }
+    # 自造号能续期但签到会被判 9074：本机客户端若正登录着这个号，就记下它的真实注册号，
+    # 签到专用（checkinDeviceId），续期身份（deviceId/realDeviceId + 自造密钥）保持不变。
+    try:
+        owned = CK.account_real_device_ids({'uid': uid})
+    except Exception:
+        owned = []
+    if owned:
+        account['checkinDeviceId'] = owned[0]
+        _log(log, '📱 该号本机已有客户端注册号 %s，签到将用它（自造号只用于续期）' % owned[0], 'dim')
+    else:
+        _log(log, '⚠️ 本机没有这个号登录的客户端，签到可能被判 9074：'
+                  '建议在 Trae 客户端登录一次该账号以获取真实设备号', 'warn')
     if not refresh:
         return {'ok': False, 'error': '没拿到 refreshToken（该账号无法续期）', 'account': None,
                 'device_key': device_key, 'waited': time.time() - started}
