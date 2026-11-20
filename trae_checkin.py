@@ -235,6 +235,8 @@ EP_ENTITLE = UgHost + '/trae/api/v2/pay/user_current_entitlement_list'
 AUTH_FAIL_CODES = (1001, 1002, 401, 403)    # 未认证 / token 失效 / 鉴权类 HTTP
 RATE_HTTP_CODES = (429, 500, 502, 503, 504)
 RATE_CODE = 9074                            # 参与用户太多（排队限流，可重试）
+REAL_DEVICE_SOURCES = ('配置', '上次可用', '客户端注册')   # 可直接签到的真实设备号来源
+SHORT_COOLDOWN_MIN = 3                      # 设备号不可信时的短冷却（分钟）
 REQ_SOURCE = 1                              # 客户端签到请求体固定带 {"req_source":1}
 REQ_BODY = '{"req_source": %d}' % REQ_SOURCE
 # 9004 / 9095 都表示「本设备今日已签到」，不是失败。
@@ -498,10 +500,19 @@ def load_state():
     except Exception:
         st = {}
     if st.get('date') != today_str():
-        st = {'date': today_str(), 'done': {}, 'cooldown': {}}
+        st = {'date': today_str(), 'done': {}, 'cooldown': {}, 'cooldown_device': {}}
     st.setdefault('done', {})
     st.setdefault('cooldown', {})
+    st.setdefault('cooldown_device', {})
     return st
+
+
+def save_state(st):
+    try:
+        with open(STATE_FILE, 'w', encoding='utf-8') as fh:
+            json.dump(st, fh, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print('⚠️  [状态] 写入失败:', e)
 
 
 def mark_done(key, info):
@@ -523,16 +534,23 @@ def cooldown_minutes():
         return PEAK_COOLDOWN_MIN if in_peak_hour() else COOLDOWN_MIN
 
 
-def set_cooldown(key, minutes):
-    """9074 后给该账号记一个冷却时间：反正换设备号/换出口 IP 都没用（实测），
-    短时间反复戳只会刷屏，冷却到点再由 cron 补签。"""
+def set_cooldown(key, minutes, device=''):
+    """9074 后给该账号记冷却，并记下当时用的设备号。
+
+    设备号是 9074 的决定性变量：客户端切到该账号后签到号会变，
+    旧冷却必须能在设备号变化时自动解除（见 cooldown_gate）。
+    """
     st = load_state()
     st['cooldown'][str(key)] = time.strftime('%Y-%m-%d %H:%M', time.localtime(time.time() + minutes * 60))
-    try:
-        with open(STATE_FILE, 'w', encoding='utf-8') as fh:
-            json.dump(st, fh, ensure_ascii=False, indent=2)
-    except Exception as e:
-        print('⚠️  [冷却] 写入失败: %s' % e)
+    st['cooldown_device'][str(key)] = str(device or '')
+    save_state(st)
+
+
+def clear_cooldown(key):
+    st = load_state()
+    st['cooldown'].pop(str(key), None)
+    st['cooldown_device'].pop(str(key), None)
+    save_state(st)
 
 
 def cooldown_left(key, state=None):
@@ -553,6 +571,32 @@ def _acct_key(acc):
             or str(acc.get('_name') or '').strip()
             or str(acc.get('name') or '').strip()
             or 'default')
+
+
+def cooldown_gate(acc):
+    """冷却检查：签到设备号变了就解除冷却。
+
+    9074 是设备维度拒绝，客户端刚被切到该账号时设备号会从「网页登录自造号」
+    变成「客户端注册号」，旧号留下的冷却对新号没有意义。之前这里只按账号键
+    判断冷却，导致切完客户端仍要干等 55 分钟（实测踩过）。
+    """
+    key = _acct_key(acc)
+    st = load_state()
+    left = cooldown_left(key, st)
+    if left <= 0:
+        return 0
+    try:
+        cur, _src = checkin_device_id(acc, acc.get('deviceId', ''), want_source=True, quiet=True)
+    except Exception:
+        return left
+    recorded = str((st.get('cooldown_device') or {}).get(str(key)) or '')
+    if str(cur or '') != recorded:
+        clear_cooldown(key)
+        print('🔓 [冷却] %s 的签到设备号已更新（%s → %s），解除冷却，本轮重试'
+              % (acc.get('_name') or acc.get('name') or key,
+                 recorded or '未记录', cur or '-'))
+        return 0
+    return left
 
 
 # ══════════════════ 日志与图标 ══════════════════
@@ -1177,11 +1221,12 @@ def rotate_device_id(acc):
             acc['checkinDeviceId'] = d
             print('🔄 [设备号] %s 换用本机为它注册的另一个真实设备号 %s' % (name, d))
             return d
-    print('ℹ️  [设备号] %s 没有可切换的其它真实设备号（生成号注定 9074，不再更换）' % name)
+    print('ℹ️  [设备号] %s 没有可切换的其它真实设备号，请在本机 Trae 客户端登录该账号后重试'
+          % name)
     return None
 
 
-def checkin_device_id(acc, manual='', want_source=False):
+def checkin_device_id(acc, manual='', want_source=False, quiet=False):
     """签到请求里 x-device-id 的取值 —— **必须是客户端真实注册过的号**。
 
     与续期身份刻意分开：网页登录自造的号能续期（token 正是它签发的），
@@ -1205,7 +1250,7 @@ def checkin_device_id(acc, manual='', want_source=False):
     if is_valid_device_id(explicit) and (not owned or explicit in owned):
         return done(explicit, '配置')
     if owned:
-        if is_valid_device_id(explicit) and explicit not in owned:
+        if is_valid_device_id(explicit) and explicit not in owned and not quiet:
             print('⚠️  [设备号] %s 配的签到号 %s 不是本机给它的注册号，自动改用 %s'
                   % (acc.get('_name') or acc.get('uid') or '?', explicit, owned[0]))
         remember = load_checkin_devices()
@@ -1652,8 +1697,9 @@ def checkin_account(acc, cache):
             result['detail'] = msg
             return result
 
-    acc['checkinDeviceId'] = checkin_device_id(acc, acc.get('deviceId', ''))
-    print('📱 [设备号] %s: %s' % (name, acc['checkinDeviceId']))
+    acc['checkinDeviceId'], dev_src = checkin_device_id(
+        acc, acc.get('deviceId', ''), want_source=True)
+    print('📱 [设备号] %s: %s（%s）' % (name, acc['checkinDeviceId'], dev_src))
     renew = str(acc.get('_realDid') or acc.get('deviceId') or '').strip()
     if renew and renew != acc['checkinDeviceId']:
         # 自造身份（网页登录）能续期但签不了到，这里分开显示便于排查
@@ -1713,7 +1759,12 @@ def checkin_account(acc, cache):
         if rotate_device_id(acc):
             ok, code, msg, gained = claim_with_retry(acc, cache)
     if code == RATE_CODE:
-        set_cooldown(_acct_key(acc), cooldown_minutes())
+        # 设备号不是客户端注册号时判不了「真限流」还是「号不对」：给短冷却，
+        # 让客户端切到该账号后（设备号变化）尽快补签；真号才用长冷却。
+        real_now = dev_src in REAL_DEVICE_SOURCES or \
+            acc['checkinDeviceId'] in account_real_device_ids(acc)
+        set_cooldown(_acct_key(acc), cooldown_minutes() if real_now else SHORT_COOLDOWN_MIN,
+                     acc['checkinDeviceId'])
     if ok:
         # claim 的 code=0 可能是假成功：当日已签过的账号对任何 device_id 都回 0
         # （上游实测）。所以「真领到」以**同一个 device_id 回查** checked_in 是否翻转
@@ -1728,7 +1779,9 @@ def checkin_account(acc, cache):
                 result['credits'] = credits if credits is not None else '-'
                 result['detail'] = ('领取接口返回成功，但同设备号回查未确认（已签=%s，查询码=%s）——'
                                     '本轮不判定签到成功，下轮自动重试') % (checked_after, code_after)
-                set_cooldown(_acct_key(acc), cooldown_minutes())
+                set_cooldown(_acct_key(acc),
+                             cooldown_minutes() if dev_src in REAL_DEVICE_SOURCES else SHORT_COOLDOWN_MIN,
+                             acc['checkinDeviceId'])
                 print('⏳ [结果] 未确认到账，转下轮')
                 return result
         pts = credits_summary(acc)
@@ -1843,7 +1896,7 @@ def main():
                             'detail': '今日已完成（%s），跳过请求' % rec.get('at', '-')})
             print('☑️  [%s] 今日已签到，跳过' % (acc.get('_name') or acc.get('name') or key))
         else:
-            left = cooldown_left(key)
+            left = cooldown_gate(acc)
             if left > 0:
                 print('⏳ [冷却] %s 9074 冷却中，还剩 %d 分钟，本轮跳过'
                       % (acc.get('_name') or acc.get('name') or key, (left + 59) // 60))

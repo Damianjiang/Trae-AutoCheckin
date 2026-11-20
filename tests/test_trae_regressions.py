@@ -52,7 +52,7 @@ class TraeAlreadyCheckedInTests(unittest.TestCase):
 
     def test_checkin_account_reports_9004_as_signed(self):
         account = {"accessToken": "token", "deviceId": "device", "name": "tester"}
-        with patch.object(CHECKIN, "checkin_device_id", return_value="device"), \
+        with patch.object(CHECKIN, "checkin_device_id", return_value=("device", "账号自带")), \
                 patch.object(CHECKIN, "status_of", return_value=(False, 0, True, 0, "{}")), \
                 patch.object(CHECKIN, "claim_with_retry", return_value=(False, 9004, "already", None)), \
                 patch.object(CHECKIN, "credits_summary", return_value=250):
@@ -64,7 +64,7 @@ class TraeAlreadyCheckedInTests(unittest.TestCase):
 
     def test_checkin_account_reports_9095_as_signed(self):
         account = {"accessToken": "token", "deviceId": "device", "name": "tester"}
-        with patch.object(CHECKIN, "checkin_device_id", return_value="device"), \
+        with patch.object(CHECKIN, "checkin_device_id", return_value=("device", "账号自带")), \
                 patch.object(CHECKIN, "status_of", return_value=(False, 0, True, 0, "{}")), \
                 patch.object(CHECKIN, "claim_with_retry", return_value=(False, 9095, "already", None)), \
                 patch.object(CHECKIN, "credits_summary", return_value=250):
@@ -116,7 +116,7 @@ class TraeCheckinDeviceIdTests(unittest.TestCase):
     def test_checkin_account_does_not_overwrite_renewal_identity(self):
         acc = {"accessToken": "token", "deviceId": "1234567890123456", "name": "tester",
                "uid": "1000000000000001", "_realDid": "1234567890123456"}
-        with patch.object(CHECKIN, "checkin_device_id", return_value="aha-real"), \
+        with patch.object(CHECKIN, "checkin_device_id", return_value=("aha-real", "客户端注册")), \
                 patch.object(CHECKIN, "status_of", return_value=(True, 100, True, 0, "{}")), \
                 patch.object(CHECKIN, "credits_summary", return_value=100):
             with redirect_stdout(io.StringIO()):
@@ -311,6 +311,40 @@ class TraePickBatchTests(unittest.TestCase):
 
     def test_empty_pending_is_empty(self):
         self.assertEqual([], self._pick("2", []))
+
+
+class CooldownGateTests(unittest.TestCase):
+    """客户端切到该账号后设备号变化，旧冷却必须自动解除。"""
+
+    UID = "1000000000000999"
+    OLD_DEVICE = "1111111111111111"
+    NEW_DEVICE = "2222222222222222"
+
+    def _state(self):
+        return {"date": CHECKIN.today_str(), "done": {},
+                "cooldown": {self.UID: "2099-01-01 00:00"},
+                "cooldown_device": {self.UID: self.OLD_DEVICE}}
+
+    def test_device_change_releases_cooldown(self):
+        acc = {"uid": self.UID, "deviceId": self.OLD_DEVICE, "name": "tester"}
+        with patch.object(CHECKIN, "load_state", return_value=self._state()), \
+                patch.object(CHECKIN, "checkin_device_id",
+                             return_value=(self.NEW_DEVICE, "客户端注册")), \
+                patch.object(CHECKIN, "clear_cooldown") as clear:
+            with redirect_stdout(io.StringIO()):
+                left = CHECKIN.cooldown_gate(acc)
+        self.assertEqual(0, left)
+        clear.assert_called_once_with(self.UID)
+
+    def test_same_device_keeps_cooldown(self):
+        acc = {"uid": self.UID, "deviceId": self.OLD_DEVICE, "name": "tester"}
+        with patch.object(CHECKIN, "load_state", return_value=self._state()), \
+                patch.object(CHECKIN, "checkin_device_id",
+                             return_value=(self.OLD_DEVICE, "账号自带")), \
+                patch.object(CHECKIN, "clear_cooldown") as clear:
+            left = CHECKIN.cooldown_gate(acc)
+        self.assertGreater(left, 0)
+        clear.assert_not_called()
 
 
 if __name__ == "__main__":

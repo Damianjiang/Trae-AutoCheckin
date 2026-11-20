@@ -1574,6 +1574,10 @@ class App(tk.Tk):
         name = payload.get('name') or '账号'
         pair = payload.get('pair') or {}
         if res.get('ok'):
+            try:
+                import trae_checkin as checkin
+            except Exception:                               # noqa: BLE001
+                checkin = None
             for item in self.cfg.get('accounts', []):
                 if str(item.get('name') or '') == name:
                     if pair.get('privateKeyPem'):
@@ -1582,8 +1586,18 @@ class App(tk.Tk):
                         item['devicePubPem'] = pair['publicKeyPem']
                     if pair.get('machineId') and not item.get('machineId'):
                         item['machineId'] = pair['machineId']
+                    # 客户端已切到这个号：签到设备号随之变化，旧冷却必须立即解除
+                    if checkin is not None:
+                        try:
+                            owned = checkin.account_real_device_ids(item)
+                            if owned:
+                                item['checkinDeviceId'] = owned[0]
+                            checkin.clear_cooldown(acct_key(item))
+                        except Exception:                   # noqa: BLE001
+                            pass
             self._after_accounts_changed()
             self.log_ui('✅ 切换完成：%s' % (res.get('message') or ''), 'ok')
+            self.log_ui('已按客户端当前登录态更新签到设备号并解除冷却，可直接签到', 'dim')
             messagebox.showinfo('切换完成', res.get('message') or '已切换', parent=self)
         else:
             self.log_ui('❌ 切换失败：%s' % (res.get('message') or '未知原因'), 'err')
@@ -1609,6 +1623,11 @@ class App(tk.Tk):
                     if owned and owned[0] != str(acc.get('checkinDeviceId') or ''):
                         acc['checkinDeviceId'] = owned[0]
                         changed += 1
+                        # 新设备号跟旧冷却无关，解冻让本轮补签直接用它
+                        try:
+                            checkin.clear_cooldown(acct_key(acc))
+                        except Exception:                # noqa: BLE001
+                            pass
                 except Exception:                        # noqa: BLE001
                     pass
             if SWITCH is None:
@@ -2422,6 +2441,21 @@ class App(tk.Tk):
             self.log_ui('已达到最大补签次数（%s 次），今日停止自动重试' % sch['retryMax'], 'warn')
             return
         self.retry_at = now + timedelta(minutes=int(sch['retryIntervalMin']))
+        # 冷却中的账号到点就能补签，不必干等一整段补签间隔
+        state = read_state()
+        done = state.get('done') or {}
+        waits = []
+        for acc in self.enabled_accounts():
+            key = acct_key(acc)
+            if key in done:
+                continue
+            left = cooldown_left((state.get('cooldown') or {}).get(key))
+            if left > 0:
+                waits.append(left)
+        if waits:
+            sooner = now + timedelta(seconds=min(waits) + 60)
+            if sooner < self.retry_at:
+                self.retry_at = sooner
         self.retry_count += 1
         self.log_ui('已安排自动补签：%s（今日第 %d/%d 次）' % (
             self.retry_at.strftime('%H:%M'), self.retry_count, sch['retryMax']), 'warn')
